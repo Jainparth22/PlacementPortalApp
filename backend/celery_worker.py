@@ -22,11 +22,11 @@ celery.conf.update(
     beat_schedule={
         'daily-reminders': {
             'task': 'tasks.send_daily_reminders',
-            'schedule': 360,  # every 24 hours (360*240 ~ 24h check)
+            'schedule': 86400,  # every 24 hours (360*240 ~ 24h check)
         },
         'monthly-report': {
             'task': 'tasks.generate_monthly_report',
-            'schedule': 120,  # ~30 days (demo: 120s)
+            'schedule': 2592000,  # ~30 days (demo: 120s)
         },
     },
 )

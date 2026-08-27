@@ -1,8 +1,7 @@
 # Placement Portal Application (PPA V5)
 
 > **Production-grade campus placement system** — `Flask REST + Vue 3 SPA + Redis + Celery + Postgres/SQLite + HuggingFace ATS + Railway Volume`
->
-> **Live:** `https://your-ppa.up.railway.app` · **API Docs:** `/api/docs` (ReDoc) · `/api/swagger` (Swagger UI) · **Spec:** `api.yaml` (53 endpoints) · **Health:** `/health` · **Auth:** `JWT + JTI blacklist` (stateful logout)
+> **Live:** `https://ppa-v5.fly.dev` · **API Docs:** `/api/docs` (ReDoc) · `/api/swagger` (Swagger UI) · **Spec:** `api.yaml` (53 endpoints) · **Health:** `/health` · **Auth:** `JWT + JTI blacklist` (stateful logout)
 
 ---
 
