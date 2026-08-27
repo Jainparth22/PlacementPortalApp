@@ -105,7 +105,7 @@ def create_app():
     _login_attempts = {}
 
     def _is_rate_limited(ip):
-        """5 attempts per 60s per IP — uses Redis INCR if available, else in-memory."""
+        """20 attempts per 60s per IP — generous for demo (recruiter tries 8 accounts), uses Redis INCR if available else in-memory."""
         try:
             r = get_redis()
             if r:
@@ -113,7 +113,7 @@ def create_app():
                 count = r.incr(key)
                 if count == 1:
                     r.expire(key, 60)
-                if count > 5:
+                if count > 20:
                     return True
                 return False
         except Exception:
@@ -124,7 +124,7 @@ def create_app():
         attempts = _login_attempts.get(ip, [])
         # keep only last 60s
         attempts = [t for t in attempts if (now - t).total_seconds() < 60]
-        if len(attempts) >= 5:
+        if len(attempts) >= 20:
             _login_attempts[ip] = attempts
             return True
         attempts.append(now)
@@ -142,7 +142,7 @@ def create_app():
         # X-Forwarded-For may contain list
         client_ip = client_ip.split(',')[0].strip()
         if _is_rate_limited(client_ip):
-            return jsonify({'error': 'Too many login attempts. Try again in 60s.'}), 429
+            return jsonify({'error': 'Too many login attempts (20/min). Try again in 60s.'}), 429
 
         data = request.json
         if not data:

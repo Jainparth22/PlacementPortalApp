@@ -6,8 +6,7 @@ from models import db, User, StudentProfile, PlacementDrive, Application, Monthl
 
 
 def send_email(subject, recipients, html_body):
-    """Send email via Flask-Mail — optional, fails silently in dev without MAIL creds"""
-    # Skip if no mail creds configured (Railway without MAIL_PASSWORD)
+    """Send email via Flask-Mail — optional, fails silently if MAIL creds missing (Render 587 blocked → skipped)."""
     try:
         from flask import current_app
         if not current_app.config.get('MAIL_USERNAME') or not current_app.config.get('MAIL_PASSWORD'):
