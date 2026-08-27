@@ -1,0 +1,59 @@
+TERMINAL 1: 
+One-time Setup 
+
+python -m venv .venv
+.\.venv\Scripts\Activate
+pip install -r requirements.txt
+
+TERMINAL 1: 
+Start Redis (Docker)
+docker run -d --name redis-server -p 6379:6379 redis 
+docker start redis-server
+
+Verify Redis is running
+python -c "import redis; r = redis.from_url('redis://localhost:6379/0'); print(r.ping())"
+docker exec -it redis-server redis-cli ping
+
+
+TERMINAL 2: 
+Start Flask App
+.\.venv\Scripts\Activate
+cd .\backend\
+python app.py
+→ http://127.0.0.1:5001
+
+Seeding the data - open another terminal 
+.\.venv\Scripts\Activate
+cd .\backend\
+python SampleDataSeed.py
+
+
+TERMINAL 3: Start Celery Worker
+
+.\.venv\Scripts\Activate
+cd .\backend\
+celery -A celery_worker worker --loglevel=info --pool=solo
+
+
+TERMINAL 4: Start Celery Beat (scheduled tasks) 
+.\.venv\Scripts\Activate
+cd .\backend\
+celery -A celery_worker.celery beat --loglevel=info
+
+
+TERMINAL 5 (Optional): Cloudflare Tunnel for public access
+npx cloudflared tunnel --url http://localhost:5001
+
+
+# Ctrl+C in Terminal 5 (Cloudflare)
+# Ctrl+C in Terminal 4 (Celery beat)
+# Ctrl+C in Terminal 3 (Celery worker)
+# Ctrl+C in Terminal 2 (Flask)
+docker stop redis-server
+docker rm redis-server
+
+
+Every route follows the pattern: 
+decorator → get data → validate → query → return jsonify. 
+
+

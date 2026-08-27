@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.venv
+venv
+.ok
+.vscode
+.idea
+instance/*.db
+uploads/
+exports/
+reports/
+celerybeat-schedule*
+Sample\ Resumes

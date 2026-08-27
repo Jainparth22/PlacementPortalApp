@@ -1,0 +1,1557 @@
+openapi: 3.0.3
+info:
+  title: Placement Portal Application (PPA V5) API
+  version: 1.0.0
+  description: |
+    RESTful API for a campus placement management system.
+    Supports three roles: Admin, Company, and Student.
+
+servers:
+  - url: http://localhost:5001
+    description: Local development server
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+        role:
+          type: string
+          enum: [admin, company, student]
+        is_active:
+          type: boolean
+        is_blacklisted:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        last_login:
+          type: string
+          format: date-time
+
+    StudentProfile:
+      type: object
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        full_name:
+          type: string
+        department:
+          type: string
+        cgpa:
+          type: number
+        graduation_year:
+          type: integer
+        resume_path:
+          type: string
+        phone:
+          type: string
+        bio:
+          type: string
+        email:
+          type: string
+        is_active:
+          type: boolean
+        is_blacklisted:
+          type: boolean
+        skills:
+          type: array
+          items:
+            type: string
+
+    CompanyProfile:
+      type: object
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        company_name:
+          type: string
+        hr_name:
+          type: string
+        hr_email:
+          type: string
+        hr_phone:
+          type: string
+        website:
+          type: string
+        description:
+          type: string
+        industry:
+          type: string
+        company_size:
+          type: string
+        approval_status:
+          type: string
+          enum: [pending, approved, rejected]
+        email:
+          type: string
+        is_active:
+          type: boolean
+        is_blacklisted:
+          type: boolean
+
+    PlacementDrive:
+      type: object
+      properties:
+        id:
+          type: integer
+        company_id:
+          type: integer
+        company_name:
+          type: string
+        drive_name:
+          type: string
+        job_title:
+          type: string
+        job_description:
+          type: string
+        eligibility_branch:
+          type: string
+        min_cgpa:
+          type: number
+        eligible_year:
+          type: integer
+        application_deadline:
+          type: string
+          format: date-time
+        location:
+          type: string
+        salary:
+          type: string
+        job_type:
+          type: string
+          enum: [Full-time, Internship, Contract]
+        status:
+          type: string
+          enum: [pending, approved, rejected, closed]
+        created_at:
+          type: string
+          format: date-time
+        application_count:
+          type: integer
+
+    Application:
+      type: object
+      properties:
+        id:
+          type: integer
+        student_id:
+          type: integer
+        drive_id:
+          type: integer
+        student_name:
+          type: string
+        student_email:
+          type: string
+        student_cgpa:
+          type: number
+        student_department:
+          type: string
+        drive_name:
+          type: string
+        company_name:
+          type: string
+        job_title:
+          type: string
+        application_date:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [applied, shortlisted, selected, rejected, withdrawn]
+        interview_type:
+          type: string
+        remarks:
+          type: string
+        cover_letter:
+          type: string
+
+    Interview:
+      type: object
+      properties:
+        id:
+          type: integer
+        application_id:
+          type: integer
+        interview_date:
+          type: string
+          format: date-time
+        mode:
+          type: string
+          enum: [Online, Offline]
+        venue:
+          type: string
+        result:
+          type: string
+          enum: [pending, passed, failed]
+
+    MonthlyReport:
+      type: object
+      properties:
+        id:
+          type: integer
+        month:
+          type: string
+        total_drives:
+          type: integer
+        total_applications:
+          type: integer
+        total_selected:
+          type: integer
+        report_path:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    Notification:
+      type: object
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        message:
+          type: string
+        channel:
+          type: string
+        is_sent:
+          type: boolean
+        is_read:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    AsyncJob:
+      type: object
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        job_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        file_path:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+
+    Message:
+      type: object
+      properties:
+        message:
+          type: string
+
+paths:
+  # ─── Authentication ───────────────────────────────────
+  /api/auth/login:
+    post:
+      tags: [Authentication]
+      summary: User login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  token:
+                    type: string
+                  user:
+                    $ref: "#/components/schemas/User"
+                  profile:
+                    type: object
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Logout current user
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/auth/me:
+    get:
+      tags: [Authentication]
+      summary: Get current user info
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Current user details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: "#/components/schemas/User"
+                  profile:
+                    type: object
+
+  # ─── Notifications ────────────────────────────────────
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: Get user notifications
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: List of notifications (max 50)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Notification"
+
+  /api/notifications/{id}/read:
+    put:
+      tags: [Notifications]
+      summary: Mark a notification as read
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Notification marked as read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/notifications/read-all:
+    put:
+      tags: [Notifications]
+      summary: Mark all notifications as read
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: All notifications marked as read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  # ─── Async Jobs ───────────────────────────────────────
+  /api/jobs/{job_id}:
+    get:
+      tags: [Jobs]
+      summary: Get async job status
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AsyncJob"
+
+  # ─── Admin ────────────────────────────────────────────
+  /api/admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Get admin dashboard statistics
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Dashboard stats with chart data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_students:
+                    type: integer
+                  total_companies:
+                    type: integer
+                  total_drives:
+                    type: integer
+                  total_applications:
+                    type: integer
+                  selected_students:
+                    type: integer
+                  pending_companies:
+                    type: integer
+                  pending_drives:
+                    type: integer
+                  blacklisted_users:
+                    type: integer
+                  chart_app_status:
+                    type: object
+                  chart_drive_status:
+                    type: object
+
+  /api/admin/search:
+    get:
+      tags: [Admin]
+      summary: Search companies or students
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [companies, students]
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/admin/companies:
+    get:
+      tags: [Admin]
+      summary: List all companies
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: List of company profiles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CompanyProfile"
+
+  /api/admin/companies/pending:
+    get:
+      tags: [Admin]
+      summary: List pending companies
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Companies awaiting approval
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CompanyProfile"
+
+  /api/admin/companies/{id}/approve:
+    put:
+      tags: [Admin]
+      summary: Approve a company
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Company approved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/admin/companies/{id}/reject:
+    put:
+      tags: [Admin]
+      summary: Reject a company
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                remarks:
+                  type: string
+      responses:
+        "200":
+          description: Company rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/admin/companies/{id}/blacklist:
+    put:
+      tags: [Admin]
+      summary: Blacklist or unblacklist a company
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [blacklist, unblacklist]
+      responses:
+        "200":
+          description: Blacklist status updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/admin/drives:
+    get:
+      tags: [Admin]
+      summary: List all placement drives
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, approved, rejected, closed]
+      responses:
+        "200":
+          description: List of drives
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PlacementDrive"
+
+  /api/admin/drives/pending:
+    get:
+      tags: [Admin]
+      summary: List pending drives
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Drives awaiting approval
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PlacementDrive"
+
+  /api/admin/drives/{id}/approve:
+    put:
+      tags: [Admin]
+      summary: Approve a drive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Drive approved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/admin/drives/{id}/reject:
+    put:
+      tags: [Admin]
+      summary: Reject a drive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                remarks:
+                  type: string
+      responses:
+        "200":
+          description: Drive rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/admin/drives/{id}/close:
+    put:
+      tags: [Admin]
+      summary: Close a drive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Drive closed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/admin/students:
+    get:
+      tags: [Admin]
+      summary: List all students
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: List of student profiles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StudentProfile"
+
+  /api/admin/students/{id}/deactivate:
+    put:
+      tags: [Admin]
+      summary: Activate or deactivate a student
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [activate, deactivate]
+      responses:
+        "200":
+          description: Student status updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/admin/students/{id}/blacklist:
+    put:
+      tags: [Admin]
+      summary: Blacklist or unblacklist a student
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [blacklist, unblacklist]
+      responses:
+        "200":
+          description: Blacklist status updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/admin/applications:
+    get:
+      tags: [Admin]
+      summary: List all applications (with optional filters)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [applied, shortlisted, selected, rejected, withdrawn]
+        - name: drive_id
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of applications
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Application"
+
+  /api/admin/reports/monthly:
+    get:
+      tags: [Admin]
+      summary: List monthly reports
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: List of reports
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MonthlyReport"
+
+  /api/admin/reports/generate:
+    post:
+      tags: [Admin]
+      summary: Trigger monthly report generation (async Celery task)
+      security:
+        - BearerAuth: []
+      responses:
+        "202":
+          description: Report generation started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  job_id:
+                    type: integer
+
+  /api/admin/reports/download/{id}:
+    get:
+      tags: [Admin]
+      summary: Download a report PDF
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: PDF file
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+
+  # ─── Company ──────────────────────────────────────────
+  /api/companies/register:
+    post:
+      tags: [Company]
+      summary: Register a new company
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [company_name, email, password]
+              properties:
+                company_name:
+                  type: string
+                email:
+                  type: string
+                password:
+                  type: string
+                hr_name:
+                  type: string
+                hr_phone:
+                  type: string
+                website:
+                  type: string
+                industry:
+                  type: string
+                description:
+                  type: string
+      responses:
+        "201":
+          description: Company registered (pending approval)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/companies/profile:
+    get:
+      tags: [Company]
+      summary: Get company profile
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Company profile data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompanyProfile"
+    put:
+      tags: [Company]
+      summary: Update company profile
+      security:
+        - BearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                company_name:
+                  type: string
+                hr_name:
+                  type: string
+                hr_email:
+                  type: string
+                hr_phone:
+                  type: string
+                website:
+                  type: string
+                industry:
+                  type: string
+                description:
+                  type: string
+                company_size:
+                  type: string
+      responses:
+        "200":
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  company:
+                    $ref: "#/components/schemas/CompanyProfile"
+
+  /api/company/dashboard:
+    get:
+      tags: [Company]
+      summary: Get company dashboard
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Dashboard with stats and drives summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  company:
+                    $ref: "#/components/schemas/CompanyProfile"
+                  total_drives:
+                    type: integer
+                  total_applicants:
+                    type: integer
+                  drives_summary:
+                    type: array
+                    items:
+                      type: object
+
+  /api/company/drives:
+    get:
+      tags: [Company]
+      summary: List company's drives
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: List of drives
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PlacementDrive"
+    post:
+      tags: [Company]
+      summary: Create a new placement drive
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [drive_name, job_title]
+              properties:
+                drive_name:
+                  type: string
+                job_title:
+                  type: string
+                job_description:
+                  type: string
+                eligibility_branch:
+                  type: string
+                min_cgpa:
+                  type: number
+                eligible_year:
+                  type: integer
+                application_deadline:
+                  type: string
+                  format: date-time
+                location:
+                  type: string
+                salary:
+                  type: string
+                job_type:
+                  type: string
+      responses:
+        "201":
+          description: Drive created (pending approval)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/company/drives/{id}:
+    put:
+      tags: [Company]
+      summary: Update a drive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                drive_name:
+                  type: string
+                job_title:
+                  type: string
+                job_description:
+                  type: string
+                eligibility_branch:
+                  type: string
+                min_cgpa:
+                  type: number
+                eligible_year:
+                  type: integer
+                application_deadline:
+                  type: string
+                location:
+                  type: string
+                salary:
+                  type: string
+                job_type:
+                  type: string
+      responses:
+        "200":
+          description: Drive updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+    delete:
+      tags: [Company]
+      summary: Delete a drive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Drive deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/company/drives/{id}/applications:
+    get:
+      tags: [Company]
+      summary: Get applications for a drive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of applications
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Application"
+
+  /api/company/drives/{id}/interviews:
+    get:
+      tags: [Company]
+      summary: Get interviews for a drive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of interviews
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Interview"
+
+  /api/company/applications/{id}/status:
+    put:
+      tags: [Company]
+      summary: Update application status
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [shortlisted, selected, rejected]
+      responses:
+        "200":
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/company/applications/{id}/schedule-interview:
+    post:
+      tags: [Company]
+      summary: Schedule an interview for an application
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                interview_date:
+                  type: string
+                  format: date-time
+                mode:
+                  type: string
+                  enum: [Online, Offline]
+                venue:
+                  type: string
+      responses:
+        "201":
+          description: Interview scheduled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/company/applications/{id}/interview-result:
+    put:
+      tags: [Company]
+      summary: Update interview result
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [result]
+              properties:
+                result:
+                  type: string
+                  enum: [passed, failed]
+      responses:
+        "200":
+          description: Interview result updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  # ─── Student ──────────────────────────────────────────
+  /api/students/register:
+    post:
+      tags: [Student]
+      summary: Register a new student
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [full_name, email, password]
+              properties:
+                full_name:
+                  type: string
+                email:
+                  type: string
+                password:
+                  type: string
+                department:
+                  type: string
+                cgpa:
+                  type: number
+                graduation_year:
+                  type: integer
+                phone:
+                  type: string
+      responses:
+        "201":
+          description: Student registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/students/profile:
+    get:
+      tags: [Student]
+      summary: Get student profile
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Student profile data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StudentProfile"
+    put:
+      tags: [Student]
+      summary: Update student profile
+      security:
+        - BearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                full_name:
+                  type: string
+                department:
+                  type: string
+                cgpa:
+                  type: number
+                graduation_year:
+                  type: integer
+                phone:
+                  type: string
+                bio:
+                  type: string
+                skills:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  student:
+                    $ref: "#/components/schemas/StudentProfile"
+
+  /api/students/upload-resume:
+    post:
+      tags: [Student]
+      summary: Upload resume (PDF only)
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                resume:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Resume uploaded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/student/drives:
+    get:
+      tags: [Student]
+      summary: Browse approved placement drives
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: branch
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of approved drives
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PlacementDrive"
+
+  /api/student/drives/{id}:
+    get:
+      tags: [Student]
+      summary: Get drive details
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Drive detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlacementDrive"
+
+  /api/student/apply/{drive_id}:
+    post:
+      tags: [Student]
+      summary: Apply to a placement drive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: drive_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cover_letter:
+                  type: string
+      responses:
+        "201":
+          description: Application submitted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/student/applications:
+    get:
+      tags: [Student]
+      summary: Get student's applications
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: List of applications
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Application"
+
+  /api/student/applications/{id}/withdraw:
+    put:
+      tags: [Student]
+      summary: Withdraw an application
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Application withdrawn
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/student/history:
+    get:
+      tags: [Student]
+      summary: Get placement history
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Placement history records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+
+  /api/student/interviews:
+    get:
+      tags: [Student]
+      summary: Get scheduled interviews
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: List of interviews
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Interview"
+
+  /api/student/export-applications:
+    post:
+      tags: [Student]
+      summary: Export applications as CSV (async Celery task)
+      security:
+        - BearerAuth: []
+      responses:
+        "202":
+          description: Export job started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  job_id:
+                    type: integer
+
+  /api/student/download-export/{job_id}:
+    get:
+      tags: [Student]
+      summary: Download exported CSV file
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: CSV file download
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+
+  /api/student/ats-check:
+    post:
+      tags: [Student]
+      summary: Run ATS resume compatibility check against a drive
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [drive_id]
+              properties:
+                drive_id:
+                  type: integer
+      responses:
+        "200":
+          description: ATS analysis result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      score:
+                        type: number
+                      analysis:
+                        type: string

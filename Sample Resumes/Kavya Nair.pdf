@@ -1,0 +1,52 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 507 >>
+stream
+BT
+/F1 12 Tf
+50 750 Td
+(Kavya Nair) Tj
+0 -20 Td
+() Tj
+(Email: kavya.nair@student.com | Phone: 9876504444) Tj
+0 -14 Td
+(Department: CSE | CGPA: 9.1 | Graduation: 2026) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(SUMMARY) Tj
+0 -14 Td
+(ML researcher with 2 published papers. Dean list student.) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(SKILLS: Python, Machine Learning, NLP, PyTorch, TensorFlow) Tj
+0 -14 Td
+(PUBLICATIONS: BERT for Low-Resource NLP \(AAAI 2025\)) Tj
+0 -14 Td
+(PROJECTS: AI Resume Analyzer, Placement Portal) Tj
+0 -14 Td
+ET
+endstream
+endobj
+xref
+0 5
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000290 00000 n 
+trailer
+<< /Size 5 /Root 1 0 R >>
+startxref
+848
+%%EOF

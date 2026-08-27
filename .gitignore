@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+instance/
+*.db
+
+# venv
+.venv/
+.ok/
+venv/
+
+# Celery
+celerybeat-schedule*
+
+# IDE
+.vscode/
+.idea/
+
+# Uploads & exports
+uploads/
+exports/
+reports/
+
+# env
+.env
+.env.local
+
+# Deploy docs (keep local, not in repo) — recruiter sees README only
+RAILWAY_DEPLOY.md
+Project_Report.md
+walkthrough.md
+DEPLOYMENT_AUDIT.md

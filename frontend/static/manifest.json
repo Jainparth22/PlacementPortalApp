@@ -1,0 +1,22 @@
+{
+    "name": "Placement Portal Application",
+    "short_name": "PPA",
+    "description": "Campus Placement Portal - Manage recruitment drives, applications, and placements",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#0f172a",
+    "theme_color": "#3b82f6",
+    "orientation": "any",
+    "icons": [
+        {
+            "src": "/static/icons/icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "/static/icons/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        }
+    ]
+}

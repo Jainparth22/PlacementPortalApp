@@ -1,0 +1,54 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 527 >>
+stream
+BT
+/F1 12 Tf
+50 750 Td
+(Rahul Verma) Tj
+0 -20 Td
+() Tj
+(Email: rahul.verma@student.com | Phone: 9876501111) Tj
+0 -14 Td
+(Department: CSE | CGPA: 8.5 | Graduation: 2026) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(SUMMARY) Tj
+0 -14 Td
+(Full-stack developer with Python and React experience. Built 3 web apps.) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(SKILLS: Python, JavaScript, React, Flask, SQL, Git) Tj
+0 -14 Td
+(PROJECTS: E-Commerce Platform \(Flask, React\)) Tj
+0 -14 Td
+(Chat App \(Node.js\)) Tj
+0 -14 Td
+(Student Management \(Django\)) Tj
+0 -14 Td
+ET
+endstream
+endobj
+xref
+0 5
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000290 00000 n 
+trailer
+<< /Size 5 /Root 1 0 R >>
+startxref
+868
+%%EOF
