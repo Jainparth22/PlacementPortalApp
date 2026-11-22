@@ -6,6 +6,26 @@ info:
     RESTful API for a campus placement management system.
     Supports three roles: Admin, Company, and Student.
 
+    **Versioning:** all endpoints live under `/api/v1/`. The old unversioned `/api/...` paths still
+    work as a deprecated alias (responses carry `Deprecation: true` and a `Link: rel="successor-version"` header).
+
+    **Headers:** every response has `X-Request-ID` (send your own to trace a call across services) and
+    `X-Response-Time`. API responses are `Cache-Control: no-store`.
+
+    **Sessions:** `POST /auth/login` returns a short-lived (15 min) **access token** in the body and sets two cookies:
+    `ppa_refresh` (httpOnly, SameSite=Strict, Secure over HTTPS, path `/api/`) and `ppa_csrf` (readable by JS). Keep the access token
+    in memory and send it as `Authorization: Bearer`. When it expires call `POST /auth/refresh` (cookie + `X-CSRF-Token` header equal
+    to the `ppa_csrf` cookie): the refresh token is **rotated**, and re-using an old one revokes the whole session family.
+
+    **Idempotency:** send `Idempotency-Key: <uuid>` on POSTs that create something (apply, create drive, schedule interview,
+    generate report, export). A retry with the same key returns the original response (`Idempotent-Replay: true`) instead of
+    repeating the action; the same key with a different body is `422`; a concurrent duplicate is `409` + `Retry-After`.
+
+    **Live updates:** `GET /notifications/stream` is a Server-Sent Events stream (resume with `Last-Event-ID`).
+
+    **Rate limits:** `429 Too Many Requests` + `Retry-After` on login (per IP and per account) and on the
+    expensive per-user endpoints (report generation, CSV export, ATS check).
+
 servers:
   - url: http://localhost:5001
     description: Local development server
@@ -16,6 +36,32 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Client-generated unique key (8-128 chars). Retries with the same key return the original response.
+      schema: {type: string, example: "3f1c9a52-7d1e-4c52-9a67-1a6b0e7b1c11"}
+
+  responses:
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until the limit resets
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              retry_after:
+                type: integer
 
   schemas:
     User:
@@ -271,8 +317,37 @@ components:
           type: string
 
 paths:
+  /health:
+    get:
+      tags: [Operations]
+      summary: Health of the app and its dependencies (unversioned)
+      responses:
+        "200":
+          description: Healthy (database reachable). Redis/Celery being down only degrades features.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [ok, degraded]}
+                  database: {type: string, description: "'postgres' key instead when running on PostgreSQL"}
+                  redis:
+                    type: object
+                    properties:
+                      cache: {type: string, enum: [connected, down]}
+                      state: {type: string, enum: [connected, down]}
+                  celery:
+                    type: object
+                    properties:
+                      workers: {type: integer}
+                      mode: {type: string, enum: [async, sync-fallback]}
+                  cache: {type: object}
+                  api_version: {type: string}
+        "503":
+          description: Database unreachable
+
   # ─── Authentication ───────────────────────────────────
-  /api/auth/login:
+  /api/v1/auth/login:
     post:
       tags: [Authentication]
       summary: User login
@@ -300,6 +375,9 @@ paths:
                     type: string
                   token:
                     type: string
+                    description: Short-lived (15 min) access token. Also sets `ppa_refresh` (httpOnly) and `ppa_csrf` cookies.
+                  token_type: {type: string, example: Bearer}
+                  expires_in: {type: integer, example: 900}
                   user:
                     $ref: "#/components/schemas/User"
                   profile:
@@ -310,13 +388,109 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
-  /api/auth/logout:
+  /api/v1/auth/refresh:
     post:
       tags: [Authentication]
-      summary: Logout current user
+      summary: Exchange the httpOnly refresh cookie for a new access token (rotates the refresh token)
+      description: |
+        Requires the `ppa_refresh` cookie **and** an `X-CSRF-Token` header equal to the `ppa_csrf` cookie (double-submit CSRF
+        protection; a cross-origin `Origin` is rejected). Error `code`s: `missing`, `invalid`, `expired`, `revoked`,
+        `reuse` (a rotated token was replayed - the whole session family is revoked), `race` (two tabs refreshed at once;
+        harmless, retry), `forbidden` (account deactivated), `csrf`.
+      parameters:
+        - name: X-CSRF-Token
+          in: header
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: New access token; new refresh/CSRF cookies set
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: {type: string}
+                  token_type: {type: string, example: Bearer}
+                  expires_in: {type: integer, example: 900}
+                  user:
+                    $ref: "#/components/schemas/User"
+                  profile: {type: object}
+        "401":
+          description: Refresh failed (see `code`); cookies are cleared except for `race`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: {type: string}
+                  code: {type: string}
+        "403":
+          description: CSRF check failed
+
+  /api/v1/auth/logout-all:
+    post:
+      tags: [Authentication]
+      summary: Revoke every session (all devices) of the current user
       security:
         - BearerAuth: []
+      responses:
+        "200":
+          description: All refresh tokens revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /api/v1/notifications/stream:
+    get:
+      tags: [Notifications]
+      summary: Live notifications (Server-Sent Events)
+      description: |
+        `text/event-stream`. Events: `ready`, `notification` (data = Notification JSON, `id:` = stream id), `reconnect`
+        (server closes after `SSE_MAX_SECONDS`; reconnect with `Last-Event-ID`), plus `: keep-alive` comments.
+        Delivery is at-least-once: de-duplicate by `data.id`. `503 stream_full` means use polling (`GET /notifications`).
+        Browsers' `EventSource` cannot send an Authorization header, so read it with `fetch()` streaming.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          schema: {type: string, example: "1732290000000-0"}
+      responses:
+        "200":
+          description: Event stream
+          content:
+            text/event-stream:
+              schema: {type: string}
+        "503":
+          description: At capacity - fall back to polling
+
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Prometheus metrics (not for end users)
+      description: Bearer `METRICS_TOKEN`. Open in development without a token, disabled (404) in production without one.
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema: {type: string}
+        "401":
+          description: Missing/invalid token
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Logout (blacklists the access token, revokes the refresh-token family, clears cookies)
+      description: Idempotent. If the `ppa_refresh` cookie is present an `X-CSRF-Token` header is required. Works with an expired access token.
+      security:
+        - BearerAuth: []
+        - {}
       responses:
         "200":
           description: Logged out
@@ -325,7 +499,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/auth/me:
+  /api/v1/auth/me:
     get:
       tags: [Authentication]
       summary: Get current user info
@@ -345,7 +519,7 @@ paths:
                     type: object
 
   # ─── Notifications ────────────────────────────────────
-  /api/notifications:
+  /api/v1/notifications:
     get:
       tags: [Notifications]
       summary: Get user notifications
@@ -361,7 +535,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/Notification"
 
-  /api/notifications/{id}/read:
+  /api/v1/notifications/{id}/read:
     put:
       tags: [Notifications]
       summary: Mark a notification as read
@@ -381,7 +555,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/notifications/read-all:
+  /api/v1/notifications/read-all:
     put:
       tags: [Notifications]
       summary: Mark all notifications as read
@@ -396,7 +570,7 @@ paths:
                 $ref: "#/components/schemas/Message"
 
   # ─── Async Jobs ───────────────────────────────────────
-  /api/jobs/{job_id}:
+  /api/v1/jobs/{job_id}:
     get:
       tags: [Jobs]
       summary: Get async job status
@@ -417,7 +591,7 @@ paths:
                 $ref: "#/components/schemas/AsyncJob"
 
   # ─── Admin ────────────────────────────────────────────
-  /api/admin/dashboard:
+  /api/v1/admin/dashboard:
     get:
       tags: [Admin]
       summary: Get admin dashboard statistics
@@ -452,7 +626,7 @@ paths:
                   chart_drive_status:
                     type: object
 
-  /api/admin/search:
+  /api/v1/admin/search:
     get:
       tags: [Admin]
       summary: Search companies or students
@@ -478,7 +652,7 @@ paths:
               schema:
                 type: object
 
-  /api/admin/companies:
+  /api/v1/admin/companies:
     get:
       tags: [Admin]
       summary: List all companies
@@ -494,7 +668,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/CompanyProfile"
 
-  /api/admin/companies/pending:
+  /api/v1/admin/companies/pending:
     get:
       tags: [Admin]
       summary: List pending companies
@@ -510,7 +684,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/CompanyProfile"
 
-  /api/admin/companies/{id}/approve:
+  /api/v1/admin/companies/{id}/approve:
     put:
       tags: [Admin]
       summary: Approve a company
@@ -530,7 +704,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/admin/companies/{id}/reject:
+  /api/v1/admin/companies/{id}/reject:
     put:
       tags: [Admin]
       summary: Reject a company
@@ -558,7 +732,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/admin/companies/{id}/blacklist:
+  /api/v1/admin/companies/{id}/blacklist:
     put:
       tags: [Admin]
       summary: Blacklist or unblacklist a company
@@ -587,7 +761,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/admin/drives:
+  /api/v1/admin/drives:
     get:
       tags: [Admin]
       summary: List all placement drives
@@ -610,7 +784,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/PlacementDrive"
 
-  /api/admin/drives/pending:
+  /api/v1/admin/drives/pending:
     get:
       tags: [Admin]
       summary: List pending drives
@@ -626,7 +800,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/PlacementDrive"
 
-  /api/admin/drives/{id}/approve:
+  /api/v1/admin/drives/{id}/approve:
     put:
       tags: [Admin]
       summary: Approve a drive
@@ -646,7 +820,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/admin/drives/{id}/reject:
+  /api/v1/admin/drives/{id}/reject:
     put:
       tags: [Admin]
       summary: Reject a drive
@@ -674,7 +848,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/admin/drives/{id}/close:
+  /api/v1/admin/drives/{id}/close:
     put:
       tags: [Admin]
       summary: Close a drive
@@ -694,7 +868,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/admin/students:
+  /api/v1/admin/students:
     get:
       tags: [Admin]
       summary: List all students
@@ -710,7 +884,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/StudentProfile"
 
-  /api/admin/students/{id}/deactivate:
+  /api/v1/admin/students/{id}/deactivate:
     put:
       tags: [Admin]
       summary: Activate or deactivate a student
@@ -739,7 +913,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/admin/students/{id}/blacklist:
+  /api/v1/admin/students/{id}/blacklist:
     put:
       tags: [Admin]
       summary: Blacklist or unblacklist a student
@@ -768,7 +942,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/admin/applications:
+  /api/v1/admin/applications:
     get:
       tags: [Admin]
       summary: List all applications (with optional filters)
@@ -796,7 +970,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/Application"
 
-  /api/admin/reports/monthly:
+  /api/v1/admin/reports/monthly:
     get:
       tags: [Admin]
       summary: List monthly reports
@@ -812,8 +986,10 @@ paths:
                 items:
                   $ref: "#/components/schemas/MonthlyReport"
 
-  /api/admin/reports/generate:
+  /api/v1/admin/reports/generate:
     post:
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       tags: [Admin]
       summary: Trigger monthly report generation (async Celery task)
       security:
@@ -830,8 +1006,80 @@ paths:
                     type: string
                   job_id:
                     type: integer
+                  mode:
+                    type: string
+                    enum: [queued, sync]
+                    description: "`queued` = handed to a Celery worker, `sync` = no worker alive so it ran inline"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
-  /api/admin/reports/download/{id}:
+  /api/v1/admin/cache-stats:
+    get:
+      tags: [Admin]
+      summary: Cache hit/miss statistics for this process
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Cache statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hits: {type: integer}
+                  misses: {type: integer}
+                  hit_rate: {type: number, nullable: true}
+                  backend: {type: string, enum: [redis, memory]}
+                  memory_items: {type: integer}
+
+  /api/v1/admin/dead-letters:
+    get:
+      tags: [Admin]
+      summary: Background tasks that failed permanently (dead-letter queue)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, default: 50, maximum: 100}
+      responses:
+        "200":
+          description: Dead-lettered tasks, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        task: {type: string}
+                        task_id: {type: string}
+                        args: {type: array, items: {}}
+                        error: {type: string}
+                        failed_at: {type: number}
+
+  /api/v1/admin/dead-letters/{task_id}/replay:
+    post:
+      tags: [Admin]
+      summary: Re-queue a dead-lettered task
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "202":
+          description: Task re-queued
+        "404":
+          description: Not found
+
+  /api/v1/admin/reports/download/{id}:
     get:
       tags: [Admin]
       summary: Download a report PDF
@@ -853,7 +1101,7 @@ paths:
                 format: binary
 
   # ─── Company ──────────────────────────────────────────
-  /api/companies/register:
+  /api/v1/companies/register:
     post:
       tags: [Company]
       summary: Register a new company
@@ -889,7 +1137,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/companies/profile:
+  /api/v1/companies/profile:
     get:
       tags: [Company]
       summary: Get company profile
@@ -942,7 +1190,7 @@ paths:
                   company:
                     $ref: "#/components/schemas/CompanyProfile"
 
-  /api/company/dashboard:
+  /api/v1/company/dashboard:
     get:
       tags: [Company]
       summary: Get company dashboard
@@ -967,7 +1215,7 @@ paths:
                     items:
                       type: object
 
-  /api/company/drives:
+  /api/v1/company/drives:
     get:
       tags: [Company]
       summary: List company's drives
@@ -983,6 +1231,8 @@ paths:
                 items:
                   $ref: "#/components/schemas/PlacementDrive"
     post:
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       tags: [Company]
       summary: Create a new placement drive
       security:
@@ -1024,7 +1274,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/company/drives/{id}:
+  /api/v1/company/drives/{id}:
     put:
       tags: [Company]
       summary: Update a drive
@@ -1088,7 +1338,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/company/drives/{id}/applications:
+  /api/v1/company/drives/{id}/applications:
     get:
       tags: [Company]
       summary: Get applications for a drive
@@ -1110,7 +1360,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/Application"
 
-  /api/company/drives/{id}/interviews:
+  /api/v1/company/drives/{id}/interviews:
     get:
       tags: [Company]
       summary: Get interviews for a drive
@@ -1132,7 +1382,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/Interview"
 
-  /api/company/applications/{id}/status:
+  /api/v1/company/applications/{id}/status:
     put:
       tags: [Company]
       summary: Update application status
@@ -1163,13 +1413,14 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/company/applications/{id}/schedule-interview:
+  /api/v1/company/applications/{id}/schedule-interview:
     post:
       tags: [Company]
       summary: Schedule an interview for an application
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
         - name: id
           in: path
           required: true
@@ -1198,7 +1449,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/company/applications/{id}/interview-result:
+  /api/v1/company/applications/{id}/interview-result:
     put:
       tags: [Company]
       summary: Update interview result
@@ -1230,7 +1481,7 @@ paths:
                 $ref: "#/components/schemas/Message"
 
   # ─── Student ──────────────────────────────────────────
-  /api/students/register:
+  /api/v1/students/register:
     post:
       tags: [Student]
       summary: Register a new student
@@ -1264,7 +1515,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/students/profile:
+  /api/v1/students/profile:
     get:
       tags: [Student]
       summary: Get student profile
@@ -1317,7 +1568,7 @@ paths:
                   student:
                     $ref: "#/components/schemas/StudentProfile"
 
-  /api/students/upload-resume:
+  /api/v1/students/upload-resume:
     post:
       tags: [Student]
       summary: Upload resume (PDF only)
@@ -1341,7 +1592,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/student/drives:
+  /api/v1/student/drives:
     get:
       tags: [Student]
       summary: Browse approved placement drives
@@ -1368,7 +1619,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/PlacementDrive"
 
-  /api/student/drives/{id}:
+  /api/v1/student/drives/{id}:
     get:
       tags: [Student]
       summary: Get drive details
@@ -1388,13 +1639,14 @@ paths:
               schema:
                 $ref: "#/components/schemas/PlacementDrive"
 
-  /api/student/apply/{drive_id}:
+  /api/v1/student/apply/{drive_id}:
     post:
       tags: [Student]
       summary: Apply to a placement drive
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
         - name: drive_id
           in: path
           required: true
@@ -1416,7 +1668,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/student/applications:
+  /api/v1/student/applications:
     get:
       tags: [Student]
       summary: Get student's applications
@@ -1432,7 +1684,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/Application"
 
-  /api/student/applications/{id}/withdraw:
+  /api/v1/student/applications/{id}/withdraw:
     put:
       tags: [Student]
       summary: Withdraw an application
@@ -1452,7 +1704,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Message"
 
-  /api/student/history:
+  /api/v1/student/history:
     get:
       tags: [Student]
       summary: Get placement history
@@ -1468,7 +1720,7 @@ paths:
                 items:
                   type: object
 
-  /api/student/interviews:
+  /api/v1/student/interviews:
     get:
       tags: [Student]
       summary: Get scheduled interviews
@@ -1484,8 +1736,10 @@ paths:
                 items:
                   $ref: "#/components/schemas/Interview"
 
-  /api/student/export-applications:
+  /api/v1/student/export-applications:
     post:
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       tags: [Student]
       summary: Export applications as CSV (async Celery task)
       security:
@@ -1503,7 +1757,7 @@ paths:
                   job_id:
                     type: integer
 
-  /api/student/download-export/{job_id}:
+  /api/v1/student/download-export/{job_id}:
     get:
       tags: [Student]
       summary: Download exported CSV file
@@ -1524,7 +1778,7 @@ paths:
                 type: string
                 format: binary
 
-  /api/student/ats-check:
+  /api/v1/student/ats-check:
     post:
       tags: [Student]
       summary: Run ATS resume compatibility check against a drive
@@ -1555,3 +1809,10 @@ paths:
                         type: number
                       analysis:
                         type: string
+                  fallback:
+                    type: boolean
+                    description: True when the ATS service was unreachable and a basic profile-based answer was returned (never cached)
+                  retry_after_minutes:
+                    type: integer
+                  cached:
+                    type: boolean

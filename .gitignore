@@ -26,8 +26,18 @@ reports/
 .env
 .env.local
 
-# Deploy docs (keep local, not in repo) — recruiter sees README only
-RAILWAY_DEPLOY.md
+# Local-only docs
 Project_Report.md
 walkthrough.md
 DEPLOYMENT_AUDIT.md
+
+# Tests / tooling
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+loadtests/*.html
+loadtests/*.csv
+
+# Private interview notes
+INTERVIEW_PREP.md

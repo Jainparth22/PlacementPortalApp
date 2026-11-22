@@ -1,0 +1,9 @@
+-r requirements.txt
+pytest>=8.0
+fakeredis>=2.26
+flake8>=7.0
+mypy>=1.10
+locust>=2.29
+pyyaml>=6.0
+moto[s3]>=5.0
+openapi-spec-validator>=0.7

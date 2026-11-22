@@ -1,0 +1,133 @@
+# One command brings up the whole distributed system:
+#     docker compose up --build
+# App:      http://localhost:5001      Flower (task monitor): docker compose --profile monitoring up  -> http://localhost:5555
+# Metrics + traces: docker compose --profile observability up  -> Grafana :3000, Prometheus :9090, Jaeger :16686
+#
+# Two Redis instances on purpose (they need opposite eviction policies):
+#   redis-cache : disposable cache. maxmemory + allkeys-lru, no persistence.
+#   redis-queue : Celery broker + JWT blacklist + rate limits + dead-letter list.
+#                 AOF persistence (appendfsync everysec) and noeviction - losing/evicting these would lose jobs
+#                 or silently un-revoke tokens.
+
+x-app: &app
+  build: .
+  image: ppa:local
+  env_file:
+    - path: .env
+      required: false
+  environment: &app-env
+    APP_ENV: production
+    SECRET_KEY: ${SECRET_KEY:-change-me-local-secret-0123456789abcdef}
+    JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-local-jwt-secret-0123456789ab}
+    ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+    DATABASE_URL: postgresql://ppa:ppa@postgres:5432/ppa
+    REDIS_URL: redis://redis-cache:6379/0
+    CELERY_BROKER_URL: redis://redis-queue:6379/1
+    STATE_REDIS_URL: redis://redis-queue:6379/2
+    UPLOAD_FOLDER: /data/uploads
+    REPORTS_FOLDER: /data/reports
+    EXPORTS_FOLDER: /data/exports
+    AUTO_SEED: ${AUTO_SEED:-1}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    LOG_JSON: "1"
+    TRUSTED_PROXY_COUNT: "0"
+    METRICS_TOKEN: ${METRICS_TOKEN:-dev-metrics-token}
+    # Tracing is OFF unless an OTLP endpoint is given:  OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile observability up
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+    COOKIE_SECURE: ${COOKIE_SECURE:-0}           # set to 1 when served over HTTPS (refresh cookie is then Secure)
+  volumes:
+    - ppa_data:/data
+  depends_on: &app-deps
+    postgres: {condition: service_healthy}
+    redis-cache: {condition: service_healthy}
+    redis-queue: {condition: service_healthy}
+
+services:
+  web:
+    <<: *app
+    command: ["web"]
+    ports: ["5001:5001"]
+    stop_grace_period: 30s
+
+  worker:
+    <<: *app
+    command: ["worker"]
+    environment:
+      <<: *app-env
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      <<: *app-deps
+      web: {condition: service_healthy}
+    stop_grace_period: 60s        # > a task's runtime: warm shutdown lets the current task finish
+
+  beat:
+    <<: *app
+    command: ["beat"]
+    depends_on:
+      <<: *app-deps
+      web: {condition: service_healthy}
+
+  flower:
+    <<: *app
+    command: ["flower"]
+    profiles: ["monitoring", "observability"]
+    ports: ["5555:5555"]
+    depends_on:
+      <<: *app-deps
+      web: {condition: service_healthy}
+
+  redis-cache:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 10}
+
+  redis-queue:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes: ["queue_data:/data"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 10}
+
+  postgres:
+    image: postgres:16-alpine
+    environment: {POSTGRES_USER: ppa, POSTGRES_PASSWORD: ppa, POSTGRES_DB: ppa}
+    volumes: ["pg_data:/var/lib/postgresql/data"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U ppa -d ppa"], interval: 5s, timeout: 3s, retries: 10}
+
+  # ---- observability stack: docker compose --profile observability up  (Grafana :3000, Prometheus :9090, Jaeger :16686)
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["observability"]
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN:-dev-metrics-token}
+    entrypoint: ["/bin/sh", "-c", "printf %s \"$$METRICS_TOKEN\" > /tmp/metrics_token && exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.retention.time=7d"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [web, flower]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["observability"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"            # local demo only - remove for anything shared
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus, jaeger]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    profiles: ["observability"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686"]                           # trace UI; OTLP/HTTP on 4318 inside the network
+
+volumes:
+  ppa_data:
+  queue_data:
+  pg_data:

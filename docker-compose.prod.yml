@@ -1,0 +1,53 @@
+# Production overlay: HTTPS via Caddy, nothing but 80/443 exposed.
+#
+#   DOMAIN=ppa.example.com docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Requires in .env:  SECRET_KEY, JWT_SECRET_KEY, ADMIN_PASSWORD (strong), METRICS_TOKEN, and DOMAIN
+# (DNS A record -> this host; Caddy obtains and renews the Let's Encrypt certificate by itself).
+
+x-prod-env: &prod-env
+  APP_ENV: production
+  AUTO_SEED: "0"                 # do NOT ship demo accounts with known passwords
+  COOKIE_SECURE: "1"             # refresh cookie only over HTTPS
+  TRUSTED_PROXY_COUNT: "1"       # Caddy is the one proxy hop in front of web (client IP for rate limits)
+
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to your hostname}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [web]
+
+  web:
+    restart: unless-stopped
+    ports: !reset []             # only Caddy is reachable from outside
+    environment:
+      <<: *prod-env
+
+  worker:
+    restart: unless-stopped
+    environment:
+      <<: *prod-env
+      RUN_MIGRATIONS: "0"
+
+  beat:
+    restart: unless-stopped
+    environment:
+      <<: *prod-env
+
+  redis-cache:
+    restart: unless-stopped
+  redis-queue:
+    restart: unless-stopped
+  postgres:
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

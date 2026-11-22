@@ -1,0 +1,38 @@
+groups:
+  - name: ppa
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate(ppa_http_requests_total{status=~"5.."}[5m])) / sum(rate(ppa_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: {severity: page}
+        annotations: {summary: "More than 5% of requests are failing (5xx)"}
+      - alert: SlowP95
+        expr: histogram_quantile(0.95, sum(rate(ppa_http_request_duration_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels: {severity: warn}
+        annotations: {summary: "p95 latency above 1s"}
+      - alert: RedisDown
+        expr: ppa_redis_up == 0
+        for: 1m
+        labels: {severity: page}
+        annotations: {summary: "Redis role {{ $labels.role }} is unreachable (the app is degraded, not down)"}
+      - alert: QueueBacklog
+        expr: ppa_celery_queue_depth > 100
+        for: 10m
+        labels: {severity: warn}
+        annotations: {summary: "Celery queue has more than 100 waiting tasks for 10 minutes"}
+      - alert: NoWorkers
+        expr: ppa_celery_workers == 0
+        for: 5m
+        labels: {severity: warn}
+        annotations: {summary: "No Celery worker answers (jobs are running inline inside web requests)"}
+      - alert: DeadLettersPresent
+        expr: ppa_dead_letter_depth > 0
+        for: 1m
+        labels: {severity: warn}
+        annotations: {summary: "Permanently failed tasks need review: GET /api/v1/admin/dead-letters"}
+      - alert: OutboxBacklog
+        expr: ppa_outbox_pending > 50
+        for: 5m
+        labels: {severity: warn}
+        annotations: {summary: "Live-notification events are not being relayed (relay stalled or Redis down)"}

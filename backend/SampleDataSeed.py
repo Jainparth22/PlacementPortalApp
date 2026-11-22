@@ -390,6 +390,8 @@ def seed():
 
         # ── Commit everything ─────────────────────────────────
         db.session.commit()
+        from cache import invalidate
+        invalidate("stats", "drives")      # seeded rows must not be hidden behind cached lists
         print("\n✅  Database seeded successfully!")
         print(f"    Admin  : jainparth7040@gmail.com / admin123")
         print(f"    Company: hr@technova.com / Tech@123")

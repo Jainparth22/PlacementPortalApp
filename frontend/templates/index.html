@@ -121,6 +121,10 @@
                 <div class="dropdown">
                     <button class="btn btn-sm btn-outline-secondary position-relative" data-bs-toggle="dropdown">
                         <i class="bi bi-bell"></i>
+                        <span class="position-absolute bottom-0 end-0 translate-middle p-1 border border-light rounded-circle"
+                            :class="liveStatus==='live' ? 'bg-success' : (liveStatus==='polling' ? 'bg-warning' : 'bg-secondary')"
+                            :title="liveStatus==='live' ? 'Live updates connected' : (liveStatus==='polling' ? 'Live stream unavailable - refreshing every 30s' : 'Live updates off')"
+                            style="width:8px;height:8px;"></span>
                         <span v-if="unreadNotifications>0"
                             class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger">${unreadNotifications}</span>
                     </button>
@@ -216,7 +220,7 @@
                                         </ul>
                                     </div>
                                 </div>
-                                <small class="text-muted d-block mt-2" style="font-size: 11px;">Data seeded via <code>backend/SampleDataSeed.py</code> — run <code>python SampleDataSeed.py</code> on Railway to reset. See <code>sample_test_data.md</code>.</small>
+                                <small class="text-muted d-block mt-2" style="font-size: 11px;">Data seeded via <code>backend/SampleDataSeed.py</code> — run <code>python seed.py</code> (or <code>docker compose run --rm web seed</code>) to reset. See <code>sample_test_data.md</code>.</small>
                             </div>
                         </div>
                         <form v-if="loginTab==='reg-s'" @submit.prevent="registerStudent" novalidate>
@@ -624,7 +628,7 @@
             <div v-if="currentPage==='admin-reports'" class="container-fluid py-4">
                 <div class="d-flex justify-content-between align-items-center mb-4">
                     <h3 class="fw-bold"><i class="bi bi-graph-up me-2"></i>Reports</h3><button class="btn btn-primary"
-                        @click="generateReport"><i class="bi bi-plus-circle me-1"></i>Generate Report</button>
+                        :disabled="reportGenerating" @click="generateReport"><i class="bi bi-plus-circle me-1"></i>Generate Report</button>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
@@ -951,7 +955,7 @@
                     <div class="col-md-3">
                         <div class="card stat-card border-0 shadow-sm">
                             <div class="card-body text-center"><i class="bi bi-download stat-icon text-info"></i><button
-                                    class="btn btn-sm btn-outline-primary mt-1" @click="exportCSV"><i
+                                    class="btn btn-sm btn-outline-primary mt-1" :disabled="exportGenerating" @click="exportCSV"><i
                                         class="bi bi-filetype-csv me-1"></i>Export CSV</button><br><small
                                     class="text-muted">Export Data</small></div>
                         </div>
@@ -1297,6 +1301,10 @@
                             <small class="text-muted">(This may take 10-20 seconds)</small>
                         </div>
                         <div v-else-if="atsResult">
+                            <div v-if="atsFallback" class="alert alert-warning d-flex align-items-start small" role="alert">
+                                <i class="bi bi-exclamation-triangle-fill me-2"></i>
+                                <div><strong>ATS scoring is temporarily unavailable.</strong> The analysis service is waking up, so this is a basic profile-based fallback (not cached). Try again in about ${atsRetryMinutes} minutes.</div>
+                            </div>
                             <pre class="bg-light p-3 rounded" style="white-space:pre-wrap;">${atsResult}</pre>
                         </div>
                         <div v-else class="text-center text-muted py-4">No results yet</div>

@@ -1,59 +1,45 @@
-TERMINAL 1: 
-One-time Setup 
+=== Option A: everything in Docker (recommended) ===================================
+docker compose up --build              # web :5001, worker, beat, postgres, 2x redis
+docker compose --profile monitoring up # + Flower task monitor on :5555
+docker compose run --rm web seed       # reset demo data
+docker compose down                    # stop (add -v to also delete volumes)
 
-python -m venv .venv
-.\.venv\Scripts\Activate
-pip install -r requirements.txt
+=== Option B: native Windows dev ====================================================
+One-time:
+  python -m venv .venv
+  .\.venv\Scripts\Activate
+  pip install -r requirements-dev.txt
 
-TERMINAL 1: 
-Start Redis (Docker)
-docker run -d --name redis-server -p 6379:6379 redis 
-docker start redis-server
+TERMINAL 1 - Redis (optional; the app falls back to in-memory cache + synchronous tasks without it)
+  docker run -d --name redis-server -p 6379:6379 redis:7.4-alpine redis-server --appendonly yes
+  docker start redis-server
+  python -c "import redis; print(redis.from_url('redis://localhost:6379/0').ping())"
 
-Verify Redis is running
-python -c "import redis; r = redis.from_url('redis://localhost:6379/0'); print(r.ping())"
-docker exec -it redis-server redis-cli ping
+TERMINAL 2 - web  (SQLite, migrations applied + demo data seeded automatically on first boot)
+  cd backend
+  python app.py                          -> http://127.0.0.1:5001
 
+TERMINAL 3 - Celery worker (optional: without it, reports/exports run inline in the request)
+  cd backend
+  celery -A celery_worker worker --loglevel=info --pool=solo
 
-TERMINAL 2: 
-Start Flask App
-.\.venv\Scripts\Activate
-cd .\backend\
-python app.py
-→ http://127.0.0.1:5001
+TERMINAL 4 - Celery beat (optional: daily reminders 08:00 IST, monthly report on the 1st)
+  cd backend
+  celery -A celery_worker beat --loglevel=info
 
-Seeding the data - open another terminal 
-.\.venv\Scripts\Activate
-cd .\backend\
-python SampleDataSeed.py
+TERMINAL 5 - Flower (optional)
+  cd backend
+  celery -A celery_worker flower --port=5555
 
+=== Common tasks ====================================================================
+pytest -q                                 run the test-suite (no Redis/Postgres needed)
+flake8                                    lint
+flask --app backend/app.py db upgrade     apply migrations (production)
+flask --app backend/app.py db migrate -m "msg"   create a migration after editing models.py
+python scripts/explain_queries.py         query plans for the heavy queries
+python scripts/redis_ttl_audit.py         find Redis keys without an expiry
+locust -f loadtests/locustfile.py --host http://localhost:5001
+python scripts/chaos_demo.py              kill Redis on purpose, watch the app degrade gracefully
 
-TERMINAL 3: Start Celery Worker
-
-.\.venv\Scripts\Activate
-cd .\backend\
-celery -A celery_worker worker --loglevel=info --pool=solo
-
-
-TERMINAL 4: Start Celery Beat (scheduled tasks) 
-.\.venv\Scripts\Activate
-cd .\backend\
-celery -A celery_worker.celery beat --loglevel=info
-
-
-TERMINAL 5 (Optional): Cloudflare Tunnel for public access
-npx cloudflared tunnel --url http://localhost:5001
-
-
-# Ctrl+C in Terminal 5 (Cloudflare)
-# Ctrl+C in Terminal 4 (Celery beat)
-# Ctrl+C in Terminal 3 (Celery worker)
-# Ctrl+C in Terminal 2 (Flask)
-docker stop redis-server
-docker rm redis-server
-
-
-Every route follows the pattern: 
-decorator → get data → validate → query → return jsonify. 
-
-
+Every route follows the pattern:
+decorator -> get data -> validate -> query -> return jsonify.

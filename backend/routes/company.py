@@ -1,13 +1,22 @@
-﻿from flask import Blueprint, request, jsonify
+﻿import logging
+from flask import Blueprint, request, jsonify
+from sqlalchemy import func
 from werkzeug.security import generate_password_hash
-from models import db, User, CompanyProfile, PlacementDrive, Application, Interview, Notification
-from auth import login_required, role_required
-from cache import cache_delete, cache_delete_pattern
+from models import db, User, CompanyProfile, PlacementDrive, Application, Interview
+from events import notify
+from auth import role_required
+from cache import cache_get_or_set, make_key, invalidate
 from pagination import paginated_response
+from idempotency import idempotent
 from datetime import datetime
-from validators import validate_email, validate_password, validate_phone, validate_url, validate_cgpa, validate_year, validate_name
+from validators import validate_email, validate_password, validate_phone, validate_url, validate_cgpa, validate_year, validate_name, clean_text
 
 company_bp = Blueprint('company', __name__)
+log = logging.getLogger(__name__)
+
+
+def company_cache_ns(company_id):
+    return f'cdash{company_id}'
 
 
 # register company
@@ -19,7 +28,7 @@ def register_company():
 
     email = data.get('email', '').strip()
     password = data.get('password', '').strip()
-    company_name = data.get('company_name', '').strip()
+    company_name = clean_text(data.get('company_name', ''), 150)
 
     if not all([email, password, company_name]):
         return jsonify({'error': 'Email, password, and company name are required'}), 400
@@ -56,13 +65,13 @@ def register_company():
     company = CompanyProfile(
         user_id=user.id,
         company_name=company_name,
-        hr_name=data.get('hr_name', ''),
+        hr_name=clean_text(data.get('hr_name', ''), 100),
         hr_email=data.get('hr_email', email),
         hr_phone=data.get('hr_phone', ''),
         website=data.get('website', ''),
-        description=data.get('description', ''),
-        industry=data.get('industry', ''),
-        company_size=data.get('company_size', ''),
+        description=clean_text(data.get('description', '')),
+        industry=clean_text(data.get('industry', ''), 100),
+        company_size=clean_text(data.get('company_size', ''), 50),
         approval_status='pending',
     )
     db.session.add(company)
@@ -70,15 +79,10 @@ def register_company():
     # Notify admin
     admin = User.query.filter_by(role='admin').first()
     if admin:
-        notification = Notification(
-            user_id=admin.id,
-            message=f'New company "{company_name}" registered and awaiting approval.',
-            channel='in-app', is_sent=True,
-        )
-        db.session.add(notification)
+        notify(admin.id, f'New company "{company_name}" registered and awaiting approval.')
 
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats')
     return jsonify({'message': 'Company registered successfully. Awaiting admin approval.', 'company': company.to_dict()}), 201
 
 
@@ -104,9 +108,9 @@ def update_company_profile(user):
         ok, err = validate_name(data['company_name'], 'Company name')
         if not ok:
             return jsonify({'error': err}), 400
-        company.company_name = data['company_name']
+        company.company_name = clean_text(data['company_name'], 150)
     if data.get('hr_name'):
-        company.hr_name = data['hr_name']
+        company.hr_name = clean_text(data['hr_name'], 100)
     if data.get('hr_email'):
         if not validate_email(data['hr_email']):
             return jsonify({'error': 'HR email is not valid'}), 400
@@ -122,13 +126,14 @@ def update_company_profile(user):
             return jsonify({'error': err}), 400
         company.website = data['website']
     if data.get('description'):
-        company.description = data['description']
+        company.description = clean_text(data['description'])
     if data.get('industry'):
-        company.industry = data['industry']
+        company.industry = clean_text(data['industry'], 100)
     if data.get('company_size'):
-        company.company_size = data['company_size']
+        company.company_size = clean_text(data['company_size'], 50)
 
     db.session.commit()
+    invalidate('drives')   # cached drive cards embed the company name
     return jsonify({'message': 'Profile updated', 'company': company.to_dict()}), 200
 
 
@@ -140,23 +145,21 @@ def company_dashboard(user):
     if not company:
         return jsonify({'error': 'Company not found'}), 404
 
-    drives = PlacementDrive.query.filter_by(company_id=company.id).all()
-    total_applicants = sum(d.applications.count() for d in drives)
+    def build():
+        rows = (db.session.query(PlacementDrive.id, PlacementDrive.drive_name, PlacementDrive.status, func.count(Application.id))
+                .outerjoin(Application, Application.drive_id == PlacementDrive.id)
+                .filter(PlacementDrive.company_id == company.id)
+                .group_by(PlacementDrive.id, PlacementDrive.drive_name, PlacementDrive.status)
+                .order_by(PlacementDrive.id).all())
+        return {
+            'total_drives': len(rows),
+            'total_applicants': sum(r[3] for r in rows),
+            'drives_summary': [{'id': r[0], 'drive_name': r[1], 'status': r[2], 'applicants': r[3]} for r in rows],
+        }
 
-    return jsonify({
-        'company': company.to_dict(),
-        'total_drives': len(drives),
-        'total_applicants': total_applicants,
-        'drives_summary': [
-            {
-                'id': d.id,
-                'drive_name': d.drive_name,
-                'status': d.status,
-                'applicants': d.applications.count(),
-            }
-            for d in drives
-        ],
-    }), 200
+    # one grouped query instead of 1 + N counts; cached per company and busted via company_cache_ns()
+    data = cache_get_or_set(make_key(company_cache_ns(company.id), 'dashboard'), build, ttl=120)
+    return jsonify({'company': company.to_dict(), **data}), 200
 
 
 # placement drives — paginated
@@ -174,6 +177,7 @@ def list_company_drives(user):
 
 @company_bp.route('/api/company/drives', methods=['POST'])
 @role_required('company')
+@idempotent
 def create_drive(user):
     company = CompanyProfile.query.filter_by(user_id=user.id).first()
     if not company:
@@ -185,8 +189,8 @@ def create_drive(user):
     if not data:
         return jsonify({'error': 'No data provided'}), 400
 
-    drive_name = data.get('drive_name', '').strip()
-    job_title = data.get('job_title', '').strip()
+    drive_name = clean_text(data.get('drive_name', ''), 200)
+    job_title = clean_text(data.get('job_title', ''), 150)
     if not drive_name or not job_title:
         return jsonify({'error': 'Drive name and job title are required'}), 400
 
@@ -213,14 +217,14 @@ def create_drive(user):
         company_id=company.id,
         drive_name=drive_name,
         job_title=job_title,
-        job_description=data.get('job_description', ''),
-        eligibility_branch=data.get('eligibility_branch', ''),
+        job_description=clean_text(data.get('job_description', '')),
+        eligibility_branch=clean_text(data.get('eligibility_branch', ''), 200),
         min_cgpa=float(data.get('min_cgpa', 0)),
         eligible_year=int(data.get('eligible_year', 0)) if data.get('eligible_year') else None,
         application_deadline=deadline,
-        location=data.get('location', ''),
-        salary=data.get('salary', ''),
-        job_type=data.get('job_type', 'Full-time'),
+        location=clean_text(data.get('location', ''), 100),
+        salary=clean_text(data.get('salary', ''), 100),
+        job_type=clean_text(data.get('job_type', 'Full-time'), 50),
         status='pending',
     )
     db.session.add(drive)
@@ -228,15 +232,10 @@ def create_drive(user):
     # Notify admin
     admin = User.query.filter_by(role='admin').first()
     if admin:
-        notification = Notification(
-            user_id=admin.id,
-            message=f'New placement drive "{drive_name}" by {company.company_name} awaiting approval.',
-            channel='in-app', is_sent=True,
-        )
-        db.session.add(notification)
+        notify(admin.id, f'New placement drive "{drive_name}" by {company.company_name} awaiting approval.')
 
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats', company_cache_ns(company.id))
     return jsonify({'message': 'Drive created. Awaiting admin approval.', 'drive': drive.to_dict()}), 201
 
 
@@ -252,13 +251,13 @@ def update_drive(user, id):
 
     data = request.json
     if data.get('drive_name'):
-        drive.drive_name = data['drive_name']
+        drive.drive_name = clean_text(data['drive_name'], 200)
     if data.get('job_title'):
-        drive.job_title = data['job_title']
+        drive.job_title = clean_text(data['job_title'], 150)
     if data.get('job_description'):
-        drive.job_description = data['job_description']
+        drive.job_description = clean_text(data['job_description'])
     if data.get('eligibility_branch'):
-        drive.eligibility_branch = data['eligibility_branch']
+        drive.eligibility_branch = clean_text(data['eligibility_branch'], 200)
     if 'min_cgpa' in data:
         drive.min_cgpa = float(data['min_cgpa'])
     if data.get('eligible_year'):
@@ -269,14 +268,14 @@ def update_drive(user, id):
         except ValueError:
             pass
     if data.get('location'):
-        drive.location = data['location']
+        drive.location = clean_text(data['location'], 100)
     if data.get('salary'):
-        drive.salary = data['salary']
+        drive.salary = clean_text(data['salary'], 100)
     if data.get('job_type'):
-        drive.job_type = data['job_type']
+        drive.job_type = clean_text(data['job_type'], 50)
 
     db.session.commit()
-    cache_delete('approved_drives')
+    invalidate('drives', company_cache_ns(company.id))
     return jsonify({'message': 'Drive updated', 'drive': drive.to_dict()}), 200
 
 
@@ -292,8 +291,7 @@ def delete_drive(user, id):
 
     db.session.delete(drive)
     db.session.commit()
-    cache_delete('admin_stats')
-    cache_delete('approved_drives')
+    invalidate('stats', 'drives', company_cache_ns(company.id))
     return jsonify({'message': 'Drive deleted'}), 200
 
 
@@ -327,7 +325,7 @@ def update_application_status(user, id):
         return jsonify({'error': 'Invalid status'}), 400
 
     app.status = new_status
-    app.remarks = data.get('remarks', app.remarks)
+    app.remarks = clean_text(data.get('remarks', app.remarks))
 
     # If selected, create placement history
     if new_status == 'selected':
@@ -343,19 +341,16 @@ def update_application_status(user, id):
         db.session.add(history)
 
     # Notify student
-    notification = Notification(
-        user_id=app.student.user_id,
-        message=f'Your application for "{drive.drive_name}" has been updated to: {new_status}.',
-        channel='in-app', is_sent=True,
-    )
-    db.session.add(notification)
+    notify(app.student.user_id, f'Your application for "{drive.drive_name}" has been updated to: {new_status}.')
     db.session.commit()
+    invalidate('stats')
     return jsonify({'message': 'Application status updated', 'application': app.to_dict()}), 200
 
 
 # schedule interview
 @company_bp.route('/api/company/applications/<int:id>/schedule-interview', methods=['POST'])
 @role_required('company')
+@idempotent
 def schedule_interview(user, id):
     app = Application.query.get_or_404(id)
     company = CompanyProfile.query.filter_by(user_id=user.id).first()
@@ -376,7 +371,7 @@ def schedule_interview(user, id):
         application_id=app.id,
         interview_date=interview_date,
         mode=data.get('mode', 'Online'),
-        venue=data.get('venue', ''),
+        venue=clean_text(data.get('venue', ''), 200),
         result='pending',
     )
     db.session.add(interview)
@@ -384,12 +379,7 @@ def schedule_interview(user, id):
     app.status = 'shortlisted'
     app.interview_type = data.get('mode', 'Online')
 
-    notification = Notification(
-        user_id=app.student.user_id,
-        message=f'Interview scheduled for "{drive.drive_name}" on {interview_date.strftime("%Y-%m-%d %H:%M") if interview_date else "TBD"}. Mode: {data.get("mode", "Online")}.',
-        channel='in-app', is_sent=True,
-    )
-    db.session.add(notification)
+    notify(app.student.user_id, f'Interview scheduled for "{drive.drive_name}" on {interview_date.strftime("%Y-%m-%d %H:%M") if interview_date else "TBD"}. Mode: {data.get("mode", "Online")}.')
     db.session.commit()
     return jsonify({'message': 'Interview scheduled', 'interview': interview.to_dict()}), 201
 
@@ -417,12 +407,7 @@ def update_interview_result(user, id):
     interview.result = data['result']
 
     # Notify student
-    notification = Notification(
-        user_id=app.student.user_id,
-        message=f'Your interview for "{drive.drive_name}" result: {data["result"].upper()}.',
-        channel='in-app', is_sent=True,
-    )
-    db.session.add(notification)
+    notify(app.student.user_id, f'Your interview for "{drive.drive_name}" result: {data["result"].upper()}.')
     db.session.commit()
     return jsonify({'message': 'Interview result updated', 'interview': interview.to_dict()}), 200
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Wrapper to seed DB from project root — for Railway shell and local Windows.
+"""Wrapper to seed DB from project root — for a container shell and local Windows.
 Usage:
   python seed.py                 # seeds via backend/SampleDataSeed.py
   AUTO_SEED=0 python seed.py     # skip auto-seed

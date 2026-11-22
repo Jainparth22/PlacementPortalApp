@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ppa-v1';
+const CACHE_NAME = 'ppa-v2';
 const STATIC_ASSETS = [
     '/',
     '/static/css/style.css',
@@ -27,6 +27,7 @@ self.addEventListener('activate', event => {
 
 self.addEventListener('fetch', event => {
     if (event.request.method !== 'GET') return;
+    if (new URL(event.request.url).pathname.startsWith('/api/')) return;   // API responses are never cached offline
     event.respondWith(
         fetch(event.request).catch(() => caches.match(event.request))
     );

@@ -1,53 +1,53 @@
-import os
+import logging
 from flask import Blueprint, request, jsonify
-from werkzeug.security import generate_password_hash
-from models import db, User, CompanyProfile, StudentProfile, PlacementDrive, Application, DriveApproval, MonthlyReport, Notification, AsyncJob
+from sqlalchemy import func
+from models import db, User, CompanyProfile, StudentProfile, PlacementDrive, Application, DriveApproval, MonthlyReport, AsyncJob
+from events import notify
 from auth import role_required
-from cache import cache_get, cache_set, cache_delete, cache_delete_pattern
+from cache import cache_get_or_set, make_key, invalidate, cache_stats
+from ratelimit import rate_limit
+from idempotency import idempotent
+from storage import get_storage
 from pagination import paginated_response
-import datetime
 
 admin_bp = Blueprint('admin', __name__)
+log = logging.getLogger(__name__)
 
 
-# admin dashboard (cached)
+def _build_admin_stats():
+    """All dashboard numbers with a handful of grouped queries (was ~20 separate COUNTs)."""
+    app_counts = dict(db.session.query(Application.status, func.count(Application.id)).group_by(Application.status).all())
+    drive_counts = dict(db.session.query(PlacementDrive.status, func.count(PlacementDrive.id)).group_by(PlacementDrive.status).all())
+    company_counts = dict(db.session.query(CompanyProfile.approval_status, func.count(CompanyProfile.id)).group_by(CompanyProfile.approval_status).all())
+    return {
+        'total_students': StudentProfile.query.count(),
+        'total_companies': sum(company_counts.values()),
+        'total_drives': sum(drive_counts.values()),
+        'pending_companies': company_counts.get('pending', 0),
+        'approved_companies': company_counts.get('approved', 0),
+        'pending_drives': drive_counts.get('pending', 0),
+        'approved_drives': drive_counts.get('approved', 0),
+        'total_applications': sum(app_counts.values()),
+        'selected_students': app_counts.get('selected', 0),
+        'active_students': User.query.filter_by(role='student', is_active=True).count(),
+        'blacklisted_users': User.query.filter_by(is_blacklisted=True).count(),
+        'chart_app_status': {k: app_counts.get(k, 0) for k in ('applied', 'shortlisted', 'selected', 'rejected', 'withdrawn')},
+        'chart_drive_status': {k: drive_counts.get(k, 0) for k in ('pending', 'approved', 'rejected', 'closed')},
+    }
+
+
+# admin dashboard (cached, stampede-protected; invalidated by the 'stats' namespace)
 @admin_bp.route('/api/admin/dashboard', methods=['GET'])
 @role_required('admin')
 def admin_dashboard(user):
-    cached = cache_get('admin_stats')
-    if cached:
-        return jsonify(cached), 200
-
-    stats = {
-        'total_students': StudentProfile.query.count(),
-        'total_companies': CompanyProfile.query.count(),
-        'total_drives': PlacementDrive.query.count(),
-        'pending_companies': CompanyProfile.query.filter_by(approval_status='pending').count(),
-        'approved_companies': CompanyProfile.query.filter_by(approval_status='approved').count(),
-        'pending_drives': PlacementDrive.query.filter_by(status='pending').count(),
-        'approved_drives': PlacementDrive.query.filter_by(status='approved').count(),
-        'total_applications': Application.query.count(),
-        'selected_students': Application.query.filter_by(status='selected').count(),
-        'active_students': User.query.filter_by(role='student', is_active=True).count(),
-        'blacklisted_users': User.query.filter_by(is_blacklisted=True).count(),
-        # Chart data: application status breakdown
-        'chart_app_status': {
-            'applied': Application.query.filter_by(status='applied').count(),
-            'shortlisted': Application.query.filter_by(status='shortlisted').count(),
-            'selected': Application.query.filter_by(status='selected').count(),
-            'rejected': Application.query.filter_by(status='rejected').count(),
-            'withdrawn': Application.query.filter_by(status='withdrawn').count(),
-        },
-        # Chart data: drives by status
-        'chart_drive_status': {
-            'pending': PlacementDrive.query.filter_by(status='pending').count(),
-            'approved': PlacementDrive.query.filter_by(status='approved').count(),
-            'rejected': PlacementDrive.query.filter_by(status='rejected').count(),
-            'closed': PlacementDrive.query.filter_by(status='closed').count(),
-        },
-    }
-    cache_set('admin_stats', stats, ttl=300)
+    stats = cache_get_or_set(make_key('stats', 'admin'), _build_admin_stats, ttl=300)
     return jsonify(stats), 200
+
+
+@admin_bp.route('/api/admin/cache-stats', methods=['GET'])
+@role_required('admin')
+def admin_cache_stats(user):
+    return jsonify(cache_stats()), 200
 
 
 # search
@@ -106,14 +106,9 @@ def pending_companies(user):
 def approve_company(user, id):
     company = CompanyProfile.query.get_or_404(id)
     company.approval_status = 'approved'
-    notification = Notification(
-        user_id=company.user_id,
-        message=f'Your company "{company.company_name}" has been approved! You can now create placement drives.',
-        channel='in-app', is_sent=True,
-    )
-    db.session.add(notification)
+    notify(company.user_id, f'Your company "{company.company_name}" has been approved! You can now create placement drives.')
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats')
     return jsonify({'message': 'Company approved', 'company': company.to_dict()}), 200
 
 
@@ -124,14 +119,9 @@ def reject_company(user, id):
     company.approval_status = 'rejected'
     data = request.get_json(silent=True)
     remarks = data.get('remarks', '') if data else ''
-    notification = Notification(
-        user_id=company.user_id,
-        message=f'Your company "{company.company_name}" registration was rejected. {remarks}',
-        channel='in-app', is_sent=True,
-    )
-    db.session.add(notification)
+    notify(company.user_id, f'Your company "{company.company_name}" registration was rejected. {remarks}')
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats')
     return jsonify({'message': 'Company rejected', 'company': company.to_dict()}), 200
 
 
@@ -151,7 +141,7 @@ def blacklist_company(user, id):
         msg = f'Company "{company.company_name}" has been blacklisted.'
 
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats')
     return jsonify({'message': msg, 'company': company.to_dict()}), 200
 
 
@@ -186,16 +176,10 @@ def approve_drive(user, id):
         drive_id=drive.id, admin_id=user.id,
         action='approved', remarks=data.get('remarks', '') if data else '',
     )
-    notification = Notification(
-        user_id=drive.company.user_id,
-        message=f'Your placement drive "{drive.drive_name}" has been approved!',
-        channel='in-app', is_sent=True,
-    )
+    notify(drive.company.user_id, f'Your placement drive "{drive.drive_name}" has been approved!')
     db.session.add(approval)
-    db.session.add(notification)
     db.session.commit()
-    cache_delete('admin_stats')
-    cache_delete('approved_drives')
+    invalidate('stats', 'drives')
     return jsonify({'message': 'Drive approved', 'drive': drive.to_dict()}), 200
 
 
@@ -210,15 +194,10 @@ def reject_drive(user, id):
         drive_id=drive.id, admin_id=user.id,
         action='rejected', remarks=remarks,
     )
-    notification = Notification(
-        user_id=drive.company.user_id,
-        message=f'Your placement drive "{drive.drive_name}" was rejected. {remarks}',
-        channel='in-app', is_sent=True,
-    )
+    notify(drive.company.user_id, f'Your placement drive "{drive.drive_name}" was rejected. {remarks}')
     db.session.add(approval)
-    db.session.add(notification)
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats')
     return jsonify({'message': 'Drive rejected', 'drive': drive.to_dict()}), 200
 
 
@@ -228,8 +207,7 @@ def close_drive(user, id):
     drive = PlacementDrive.query.get_or_404(id)
     drive.status = 'closed'
     db.session.commit()
-    cache_delete('admin_stats')
-    cache_delete('approved_drives')
+    invalidate('stats', 'drives')
     return jsonify({'message': 'Drive closed', 'drive': drive.to_dict()}), 200
 
 
@@ -259,7 +237,7 @@ def deactivate_student(user, id):
         msg = f'Student "{student.full_name}" has been deactivated.'
 
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats')
     return jsonify({'message': msg}), 200
 
 
@@ -279,7 +257,7 @@ def blacklist_student(user, id):
         msg = f'Student "{student.full_name}" has been blacklisted.'
 
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats')
     return jsonify({'message': msg}), 200
 
 
@@ -312,43 +290,50 @@ def monthly_reports(user):
 
 @admin_bp.route('/api/admin/reports/generate', methods=['POST'])
 @role_required('admin')
+@idempotent
+@rate_limit('report-generate')
 def trigger_monthly_report(user):
     from tasks import generate_monthly_report
-    from cache import get_redis
-    job = AsyncJob(
-        user_id=user.id,
-        job_type='generate_monthly_report',
-        status='pending',
-    )
+    from async_dispatch import dispatch
+    job = AsyncJob(user_id=user.id, job_type='generate_monthly_report', status='pending')
     db.session.add(job)
     db.session.commit()
-    # Try Celery async; fallback to sync if Redis/worker unavailable (single-web deploy)
-    try:
-        # If Redis down, run sync directly
-        if get_redis() is None:
-            raise RuntimeError("Redis unavailable — running sync")
-        generate_monthly_report.delay(job.id)
-    except Exception as e:
-        print(f"[!] Celery delay failed ({e}), falling back to sync report generation")
-        try:
-            # Run synchronously so 202 job still completes even without worker
-            generate_monthly_report(job.id)
-        except Exception as se:
-            print(f"[!] Sync report also failed: {se}")
-    return jsonify({'message': 'Monthly report generation started', 'job_id': job.id}), 202
+    # Queue on Celery when a worker is alive, otherwise run inline so the job still completes.
+    mode = dispatch(generate_monthly_report, job.id)
+    return jsonify({'message': 'Monthly report generation started', 'job_id': job.id, 'mode': mode}), 202
+
+
+# dead-letter queue: tasks that failed permanently
+@admin_bp.route('/api/admin/dead-letters', methods=['GET'])
+@role_required('admin')
+def list_dead_letters_route(user):
+    from dead_letter import list_dead_letters
+    limit = min(100, max(1, request.args.get('limit', 50, type=int)))
+    return jsonify({'items': list_dead_letters(limit)}), 200
+
+
+@admin_bp.route('/api/admin/dead-letters/<task_id>/replay', methods=['POST'])
+@role_required('admin')
+def replay_dead_letter_route(user, task_id):
+    from dead_letter import replay_dead_letter
+    if replay_dead_letter(task_id):
+        return jsonify({'message': 'Task re-queued'}), 202
+    return jsonify({'error': 'Dead-letter entry not found'}), 404
 
 
 @admin_bp.route('/api/admin/reports/download/<int:id>', methods=['GET'])
 @role_required('admin')
 def download_report(user, id):
-    from flask import send_file
-    report = MonthlyReport.query.get_or_404(id)
-    fmt = request.args.get('format', 'pdf')
-    if fmt == 'pdf':
-        pdf_path = report.report_path.replace('.html', '.pdf') if report.report_path else None
-        if pdf_path and os.path.exists(pdf_path):
-            return send_file(pdf_path, as_attachment=True, download_name=f'report_{report.month}.pdf')
-    if report.report_path and os.path.exists(report.report_path):
-        return send_file(report.report_path, as_attachment=True, download_name=f'report_{report.month}.html')
-    return jsonify({'error': 'Report file not found'}), 404
+    report = db.get_or_404(MonthlyReport, id)
+    if not report.report_path:
+        return jsonify({'error': 'Report file not found'}), 404
+    storage = get_storage()
+    html_key = report.report_path
+    pdf_key = html_key[:-5] + '.pdf' if html_key.endswith('.html') else html_key
+    try:
+        if request.args.get('format', 'pdf') == 'pdf' and storage.exists(pdf_key):
+            return storage.send(pdf_key, f'report_{report.month}.pdf', 'application/pdf')
+        return storage.send(html_key, f'report_{report.month}.html', 'text/html')
+    except (FileNotFoundError, ValueError):
+        return jsonify({'error': 'Report file not found'}), 404
 

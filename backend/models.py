@@ -12,6 +12,7 @@ class User(db.Model):
     role = db.Column(db.String(20), nullable=False)  # admin, company, student
     is_active = db.Column(db.Boolean, default=True)
     is_blacklisted = db.Column(db.Boolean, default=False)
+    __table_args__ = (db.Index('ix_users_role', 'role'),)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_login = db.Column(db.DateTime)
 
@@ -78,7 +79,7 @@ class CompanyProfile(db.Model):
     description = db.Column(db.Text)
     industry = db.Column(db.String(100))
     company_size = db.Column(db.String(50))
-    approval_status = db.Column(db.String(20), default='pending')  # pending, approved, rejected
+    approval_status = db.Column(db.String(20), default='pending', index=True)  # pending, approved, rejected
 
     placement_drives = db.relationship('PlacementDrive', backref='company', lazy='dynamic', cascade='all, delete-orphan')
 
@@ -104,19 +105,21 @@ class CompanyProfile(db.Model):
 class PlacementDrive(db.Model):
     __tablename__ = 'placement_drives'
     id = db.Column(db.Integer, primary_key=True)
-    company_id = db.Column(db.Integer, db.ForeignKey('company_profiles.id'), nullable=False)
+    company_id = db.Column(db.Integer, db.ForeignKey('company_profiles.id'), nullable=False, index=True)
     drive_name = db.Column(db.String(200), nullable=False)
     job_title = db.Column(db.String(150), nullable=False)
     job_description = db.Column(db.Text)
     eligibility_branch = db.Column(db.String(200))  # comma separated
     min_cgpa = db.Column(db.Float, default=0.0)
     eligible_year = db.Column(db.Integer)
-    application_deadline = db.Column(db.DateTime)
+    application_deadline = db.Column(db.DateTime, index=True)
     location = db.Column(db.String(100))
     salary = db.Column(db.String(100))
     job_type = db.Column(db.String(50))  # Full-time / Internship
-    status = db.Column(db.String(20), default='pending')  # pending, approved, rejected, closed
+    status = db.Column(db.String(20), default='pending', index=True)  # pending, approved, rejected, closed
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (db.Index('ix_drives_status_deadline', 'status', 'application_deadline'),)
 
     applications = db.relationship('Application', backref='drive', lazy='dynamic', cascade='all, delete-orphan')
     approvals = db.relationship('DriveApproval', backref='drive', lazy='dynamic', cascade='all, delete-orphan')
@@ -146,16 +149,19 @@ class Application(db.Model):
     __tablename__ = 'applications'
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('student_profiles.id'), nullable=False)
-    drive_id = db.Column(db.Integer, db.ForeignKey('placement_drives.id'), nullable=False)
+    drive_id = db.Column(db.Integer, db.ForeignKey('placement_drives.id'), nullable=False, index=True)
     application_date = db.Column(db.DateTime, default=datetime.utcnow)
-    status = db.Column(db.String(20), default='applied')  # applied, shortlisted, selected, rejected, withdrawn
+    status = db.Column(db.String(20), default='applied', index=True)  # applied, shortlisted, selected, rejected, withdrawn
     interview_type = db.Column(db.String(50))
     remarks = db.Column(db.Text)
     cover_letter = db.Column(db.Text)
 
     interviews = db.relationship('Interview', backref='application', lazy='dynamic', cascade='all, delete-orphan')
 
-    __table_args__ = (db.UniqueConstraint('student_id', 'drive_id', name='unique_student_drive'),)
+    __table_args__ = (
+        db.UniqueConstraint('student_id', 'drive_id', name='unique_student_drive'),
+        db.Index('ix_applications_drive_date', 'drive_id', 'application_date'),
+    )
 
     def to_dict(self):
         return {
@@ -180,7 +186,7 @@ class Application(db.Model):
 class DriveApproval(db.Model):
     __tablename__ = 'drive_approvals'
     id = db.Column(db.Integer, primary_key=True)
-    drive_id = db.Column(db.Integer, db.ForeignKey('placement_drives.id'), nullable=False)
+    drive_id = db.Column(db.Integer, db.ForeignKey('placement_drives.id'), nullable=False, index=True)
     admin_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     action = db.Column(db.String(20), nullable=False)  # approved, rejected
     remarks = db.Column(db.Text)
@@ -200,7 +206,7 @@ class DriveApproval(db.Model):
 class Interview(db.Model):
     __tablename__ = 'interviews'
     id = db.Column(db.Integer, primary_key=True)
-    application_id = db.Column(db.Integer, db.ForeignKey('applications.id'), nullable=False)
+    application_id = db.Column(db.Integer, db.ForeignKey('applications.id'), nullable=False, index=True)
     interview_date = db.Column(db.DateTime)
     mode = db.Column(db.String(50))  # Online / Offline
     venue = db.Column(db.String(200))
@@ -220,7 +226,7 @@ class Interview(db.Model):
 class PlacementHistory(db.Model):
     __tablename__ = 'placement_history'
     id = db.Column(db.Integer, primary_key=True)
-    student_id = db.Column(db.Integer, db.ForeignKey('student_profiles.id'), nullable=False)
+    student_id = db.Column(db.Integer, db.ForeignKey('student_profiles.id'), nullable=False, index=True)
     company_name = db.Column(db.String(150))
     job_title = db.Column(db.String(150))
     selection_date = db.Column(db.DateTime)
@@ -271,6 +277,8 @@ class Notification(db.Model):
     is_read = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    __table_args__ = (db.Index('ix_notifications_user_created', 'user_id', 'created_at'),)
+
     def to_dict(self):
         return {
             'id': self.id,
@@ -286,7 +294,7 @@ class Notification(db.Model):
 class AsyncJob(db.Model):
     __tablename__ = 'async_jobs'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     job_type = db.Column(db.String(50), nullable=False)
     status = db.Column(db.String(20), default='pending')  # pending, running, completed, failed
     file_path = db.Column(db.String(256))
@@ -308,7 +316,7 @@ class AsyncJob(db.Model):
 class Skill(db.Model):
     __tablename__ = 'skills'
     id = db.Column(db.Integer, primary_key=True)
-    student_id = db.Column(db.Integer, db.ForeignKey('student_profiles.id'), nullable=False)
+    student_id = db.Column(db.Integer, db.ForeignKey('student_profiles.id'), nullable=False, index=True)
     skill_name = db.Column(db.String(100), nullable=False)
 
     def to_dict(self):
@@ -317,3 +325,33 @@ class Skill(db.Model):
             'student_id': self.student_id,
             'skill_name': self.skill_name,
         }
+
+
+class RefreshToken(db.Model):
+    """Rotating refresh tokens (only a SHA-256 hash is stored). One *family* per login; reuse of a rotated
+    token revokes the whole family (theft detection). See backend/sessions.py."""
+    __tablename__ = 'refresh_tokens'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    family_id = db.Column(db.String(36), nullable=False, index=True)
+    token_hash = db.Column(db.String(64), nullable=False, unique=True)
+    issued_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False, index=True)
+    used_at = db.Column(db.DateTime)        # set when rotated
+    revoked_at = db.Column(db.DateTime)
+    user_agent = db.Column(db.String(200))
+    ip = db.Column(db.String(45))
+
+
+class OutboxEvent(db.Model):
+    """Transactional outbox: written in the SAME transaction as the business change, relayed to Redis
+    Streams afterwards (at-least-once). See backend/events.py."""
+    __tablename__ = 'outbox_events'
+    id = db.Column(db.Integer, primary_key=True)
+    event_type = db.Column(db.String(50), nullable=False)
+    user_id = db.Column(db.Integer, index=True)          # recipient for per-user streams (None = global only)
+    payload = db.Column(db.Text, nullable=False)         # JSON
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    published_at = db.Column(db.DateTime)
+
+    __table_args__ = (db.Index('ix_outbox_unpublished', 'published_at', 'id'),)

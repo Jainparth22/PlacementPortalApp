@@ -26,10 +26,10 @@ Here’s where you can see my computer science fundamentals applied in practice:
 | **System Design** | 12 tables in `models.py`, `UniqueConstraint(student, drive)`, state machines for drives | Shows I know how to model complex, real-world relationships, going way beyond a simple `users` table. |
 | **REST API Architecture** | 53 endpoints in `api.yaml`, consistent pattern (`decorator → validate → query → jsonify`), pagination | Proves I write consistent, predictable, and scalable APIs, rather than ad-hoc scripts. |
 | **Auth & Access Control** | `@role_required` decorators, JWT expiration, **stateful JTI blacklisting** in `auth.py` | Shows a deep understanding of session management and token revocation, not just basic stateless JWTs. |
-| **Security Best Practices** | Input validation, secure file uploads, 5MB file limits, **rate limiting (5/min)** via Redis | Demonstrates maturity in defense-in-depth and protecting infrastructure from abuse. |
+| **Security Best Practices** | Input validation, secure file uploads, 5MB file limits, **rate limiting (per IP + per account + per user)** via Redis | Demonstrates maturity in defense-in-depth and protecting infrastructure from abuse. |
 | **Performance Optimization** | Redis Cache-Aside (`cache.py`), global pagination | Shows I build for scale so the database and DOM don't choke under load. |
 | **Asynchronous Processing** | Celery + Beat in `tasks.py` for emails and heavy PDF reports, with a **sync fallback** | Proves I know when to offload heavy tasks to a background worker, and how to gracefully degrade if the worker is down. |
-| **Resilient Data Handling** | Railway Volumes (`/data`), relative paths, ATS gracefully handling missing PDFs | Highlights my understanding of ephemeral filesystems in modern cloud deployments. |
+| **Resilient Data Handling** | A persistent `/data` volume for uploads/reports, relative paths, ATS gracefully handling missing PDFs | Highlights my understanding of ephemeral container filesystems. |
 
 ---
 
@@ -41,10 +41,10 @@ I didn't just pick tools because they are popular; I picked them to solve specif
 |----------|----------------|----------------------|
 | **Flask over Django** | I wanted explicit control over 53 endpoints using Blueprints, keeping the architecture lean and modular. | — |
 | **Vue 3 CDN over React** | I wanted a reactive SPA without the overhead of a build step (`npm run build`). | — |
-| **Postgres (Prod) + SQLite (Local)** | Railway automatically provisions Postgres for production, while SQLite makes local development zero-setup. | If the `DATABASE_URL` is missing, it safely falls back to local SQLite. |
-| **Redis vs In-Memory** | A true distributed cache is needed for rate-limiting and token blacklisting across multiple workers. | If Redis fails to connect, the app gracefully degrades to an in-memory dictionary so it doesn't crash. |
+| **Postgres (Prod) + SQLite (Local)** | PostgreSQL for production concurrency, SQLite so local development is zero-setup; schema changes are Alembic migrations. | If `DATABASE_URL` is missing, it safely falls back to local SQLite. |
+| **Redis (3 roles) vs In-Memory** | Redis is the shared cache, the Celery queue, and the durable store for token blacklist/rate limits; each has different eviction/persistence needs so they are configured separately. | If Redis fails, the app degrades to an in-process cache and in-memory counters instead of crashing. |
 | **Celery vs Threading** | Celery provides a true queue for heavy report generation and scheduled reminders. | If Celery/Redis is down, the code catches it and runs the task synchronously so the user still gets their report. |
-| **Railway Volumes** | Heroku-style ephemeral filesystems wipe user uploads on redeploy. I mounted a persistent `/data` volume. | If the volume isn't found, it falls back to a relative `backend/uploads` directory. |
+| **Persistent volume** | Container filesystems are ephemeral and would wipe user uploads on redeploy, so uploads/reports/exports live on a mounted `/data` volume. | If the volume isn't found, it falls back to a relative `backend/uploads` directory. |
 
 ---
 
@@ -78,7 +78,7 @@ If you'd like to test the app, here are a few things to try out, ranging from ob
 6. **Smart Validation:** Log in as a Student and apply for a drive. If your CGPA doesn't meet the drive's cutoff, the API actively rejects the application. 
 
 ### The Subtle Engineering Details 
-7. **Rate Limiting:** Try rapidly clicking the Login button 6 times with a wrong password. You'll hit my custom `429 Too Many Requests` rate limiter.
+7. **Rate Limiting:** Send 21 login requests within a minute with a wrong password. You'll hit my custom `429 Too Many Requests` rate limiter.
 8. **File Guardrails:** Go to Profile -> Resume and try uploading a `.docx` file. The backend explicitly rejects it (`400 Bad Request`), strictly enforcing a 5MB PDF-only policy.
 9. **Asynchronous Polling:** As an Admin, go to Reports -> Generate. Watch the UI automatically poll the `/jobs/<id>` endpoint every 3 seconds until the backend finishes generating the PDF and serves the download. 
 10. **Stateful Logout:** Log out, then try to manually hit an API endpoint with your old Bearer token in Postman. The server will reject it immediately because the token ID was added to the Redis blacklist.

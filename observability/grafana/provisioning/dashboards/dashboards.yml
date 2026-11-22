@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: ppa
+    folder: PPA
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

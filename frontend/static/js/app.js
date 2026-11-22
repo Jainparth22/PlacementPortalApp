@@ -1,5 +1,6 @@
 // Placement Portal - Vue 3 SPA
 const API = '';
+const API_PREFIX = '/api/v1';   // versioned API; unversioned /api/* still works but is deprecated
 
 const { createApp } = Vue;
 
@@ -14,7 +15,8 @@ const app = createApp({
             // Auth
             currentPage: 'login',
             isLoggedIn: false,
-            token: localStorage.getItem('ppa_token') || '',
+            token: '',                       // access token: JS memory only (never localStorage); renewed via httpOnly refresh cookie
+            liveStatus: 'off',               // off | live | polling   (server-sent events for notifications)
             user: JSON.parse(localStorage.getItem('ppa_user') || '{}'),
             loading: false,
             alert: { show: false, type: 'success', message: '' },
@@ -93,6 +95,10 @@ const app = createApp({
             myInterviews: [],
             atsResult: null,
             atsLoading: false,
+            atsFallback: false,
+            atsRetryMinutes: 10,
+            reportGenerating: false,
+            exportGenerating: false,
             studentProfileForm: {},
             skillsInput: '',
             driveSearch: '',
@@ -150,23 +156,78 @@ const app = createApp({
             localStorage.setItem('ppa_darkmode', this.darkMode ? '1' : '0');
         },
 
-        // api helper
-        async api(url, method = 'GET', body = null) {
-            const opts = {
-                method,
-                headers: {},
-            };
-            if (this.token) opts.headers['Authorization'] = `Bearer ${this.token}`;
-            if (body) {
-                opts.headers['Content-Type'] = 'application/json';
-                opts.body = JSON.stringify(body);
-            }
+        // /api/x -> /api/v1/x
+        v1(url) {
+            return url.startsWith('/api/') && !url.startsWith(API_PREFIX + '/') ? API_PREFIX + url.slice(4) : url;
+        },
 
+        // ---- session handling -------------------------------------------------------------------------
+        csrfToken() {
+            const m = document.cookie.match(/(?:^|;\s*)ppa_csrf=([^;]+)/);
+            return m ? decodeURIComponent(m[1]) : '';
+        },
+        // One refresh at a time per tab (the server also tolerates two tabs racing).
+        refreshAccessToken() {
+            if (this._refreshing) return this._refreshing;
+            this._refreshing = (async () => {
+                try {
+                    const res = await fetch(API + API_PREFIX + '/auth/refresh', {
+                        method: 'POST', headers: { 'X-CSRF-Token': this.csrfToken() }, credentials: 'same-origin',
+                    });
+                    if (!res.ok) return false;
+                    const data = await res.json();
+                    this.token = data.token;
+                    this.user = data.user;
+                    localStorage.setItem('ppa_user', JSON.stringify(data.user));   // non-sensitive profile hint only
+                    if (data.profile) {
+                        if (data.user.role === 'company') this.companyProfile = data.profile;
+                        if (data.user.role === 'student') this.studentProfile = data.profile;
+                    }
+                    this.scheduleRefresh(data.expires_in);
+                    return true;
+                } catch (e) { return false; } finally { this._refreshing = null; }
+            })();
+            return this._refreshing;
+        },
+        scheduleRefresh(expiresIn) {            // renew at ~80% of the access-token lifetime
+            clearTimeout(this._refreshTimer);
+            this._refreshTimer = setTimeout(() => this.isLoggedIn && this.refreshAccessToken(), Math.max(30, (expiresIn || 900) * 0.8) * 1000);
+        },
+        sessionExpired() {
+            this.stopLiveNotifications();
+            this.token = ''; this.user = {}; this.isLoggedIn = false;
+            localStorage.removeItem('ppa_user');
+            this.currentPage = 'login';
+            this.showAlert('Your session expired. Please log in again.', 'warning');
+        },
+        newIdempotencyKey() {
+            return (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+                : 'k-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+        },
+        // fetch with Authorization + one transparent refresh-and-retry on 401 (used for downloads/uploads too)
+        async authFetch(url, opts = {}, retried = false) {
+            const headers = { ...(opts.headers || {}) };
+            if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+            const res = await fetch(API + this.v1(url), { ...opts, headers });
+            if (res.status === 401 && !retried && this.isLoggedIn && !url.includes('/auth/')) {
+                if (await this.refreshAccessToken()) return this.authFetch(url, opts, true);
+                this.sessionExpired();
+            }
+            return res;
+        },
+
+        // api helper (JSON). POSTs carry an Idempotency-Key, reused on the post-refresh retry.
+        async api(url, method = 'GET', body = null) {
+            const headers = {};
+            if (body) headers['Content-Type'] = 'application/json';
+            if (method === 'POST' && !url.includes('/auth/')) headers['Idempotency-Key'] = this.newIdempotencyKey();
+            if (url.endsWith('/auth/logout')) headers['X-CSRF-Token'] = this.csrfToken();
             try {
-                const res = await fetch(API + url, opts);
+                const res = await this.authFetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
                 const data = await res.json();
                 if (!res.ok) {
-                    this.showAlert(data.error || 'Request failed', 'danger');
+                    if (res.status === 401 && !this.isLoggedIn) { this.showAlert(data.error || 'Request failed', 'danger'); return null; }
+                    if (res.status !== 401 || url.includes('/auth/login')) this.showAlert(data.error || 'Request failed', 'danger');
                     return null;
                 }
                 return data;
@@ -354,13 +415,14 @@ const app = createApp({
                 this.token = res.token;
                 this.user = res.user;
                 this.isLoggedIn = true;
-                localStorage.setItem('ppa_token', res.token);
-                localStorage.setItem('ppa_user', JSON.stringify(res.user));
+                localStorage.setItem('ppa_user', JSON.stringify(res.user));   // non-sensitive hint; the token stays in memory
+                this.scheduleRefresh(res.expires_in);
                 if (res.profile) {
                     if (res.user.role === 'company') this.companyProfile = res.profile;
                     if (res.user.role === 'student') this.studentProfile = res.profile;
                 }
                 this.showAlert('Welcome back!', 'success');
+                this.startLiveNotifications();
                 this.navigate('dashboard');
             }
         },
@@ -402,23 +464,100 @@ const app = createApp({
             navigator.clipboard.writeText(text).then(() => this.showAlert('Copied to clipboard', 'success'));
         },
         async logout() {
+            this.stopLiveNotifications();
+            clearTimeout(this._refreshTimer);
             try { await this.api('/api/auth/logout', 'POST'); } catch (e) { /* ignore */ }
             this.token = '';
             this.user = {};
             this.isLoggedIn = false;
-            localStorage.removeItem('ppa_token');
             localStorage.removeItem('ppa_user');
+            localStorage.removeItem('ppa_token');      // legacy key from older versions
             this.currentPage = 'login';
             this.showAlert('Logged out', 'info');
         },
 
-        // notifications
+        // notifications -------------------------------------------------------------------------------
         async loadNotifications() {
             const n = await this.api('/api/notifications');
             if (n) {
-                this.notifications = n;
-                this.unreadNotifications = n.filter(x => !x.is_read).length;
+                const items = Array.isArray(n) ? n : (n.items || []);
+                this.notifications = items;
+                this.unreadNotifications = items.filter(x => !x.is_read).length;
             }
+        },
+        // Live notifications via Server-Sent Events. EventSource can't send an Authorization header, so we read
+        // the SSE stream with fetch(). The server stamps each event with a stream id; on reconnect we send
+        // Last-Event-ID so nothing is missed. If the stream is unavailable we fall back to polling.
+        startLiveNotifications() {
+            this.stopLiveNotifications();
+            this._liveAbort = new AbortController();
+            this._liveBackoff = 1000;
+            this._liveLoop(this._liveAbort.signal);
+        },
+        stopLiveNotifications() {
+            if (this._liveAbort) this._liveAbort.abort();
+            this._liveAbort = null;
+            clearInterval(this._pollTimer);
+            this.liveStatus = 'off';
+        },
+        async _liveLoop(signal) {
+            while (!signal.aborted && this.isLoggedIn) {
+                try {
+                    const headers = {};
+                    if (this._lastEventId) headers['Last-Event-ID'] = this._lastEventId;
+                    const res = await this.authFetch('/api/notifications/stream', { headers, signal });
+                    if (!res.ok || !res.body) throw new Error('stream unavailable: ' + res.status);
+                    this.liveStatus = 'live';
+                    clearInterval(this._pollTimer);
+                    this._liveBackoff = 1000;
+                    await this._readSSE(res.body, signal);
+                    if (!signal.aborted) continue;          // server ended the stream normally (max duration): reconnect right away
+                } catch (e) {
+                    if (signal.aborted) return;
+                }
+                if (signal.aborted) return;
+                // degraded: poll while we retry the stream with exponential backoff (max 30s)
+                this.liveStatus = 'polling';
+                clearInterval(this._pollTimer);
+                this._pollTimer = setInterval(() => this.isLoggedIn && this.loadNotifications(), 30000);
+                await new Promise(r => setTimeout(r, this._liveBackoff));
+                this._liveBackoff = Math.min(this._liveBackoff * 2, 30000);
+            }
+        },
+        async _readSSE(body, signal) {
+            const reader = body.getReader();
+            const decoder = new TextDecoder();
+            let buf = '';
+            while (!signal.aborted) {
+                const { done, value } = await reader.read();
+                if (done) return;
+                buf += decoder.decode(value, { stream: true });
+                let idx;
+                while ((idx = buf.indexOf('\n\n')) >= 0) {
+                    const block = buf.slice(0, idx);
+                    buf = buf.slice(idx + 2);
+                    this._handleSSEBlock(block);
+                }
+            }
+        },
+        _handleSSEBlock(block) {
+            let event = 'message', id = null, data = '';
+            for (const line of block.split('\n')) {
+                if (line.startsWith(':')) continue;                       // keep-alive comment
+                if (line.startsWith('event:')) event = line.slice(6).trim();
+                else if (line.startsWith('id:')) id = line.slice(3).trim();
+                else if (line.startsWith('data:')) data += line.slice(5).trim();
+            }
+            if (id) this._lastEventId = id;
+            if (event === 'notification' && data) {
+                try { this._onLiveNotification(JSON.parse(data)); } catch (e) { /* ignore malformed */ }
+            }
+        },
+        _onLiveNotification(n) {
+            if (this.notifications.some(x => x.id === n.id)) return;      // at-least-once delivery => dedupe by id
+            this.notifications = [n, ...this.notifications].slice(0, 50);
+            if (!n.is_read) this.unreadNotifications += 1;
+            this.showAlert(n.message, 'info');
         },
         async markRead(id) {
             await this.api(`/api/notifications/${id}/read`, 'PUT');
@@ -486,9 +625,7 @@ const app = createApp({
         },
         async downloadReport(id) {
             try {
-                const resp = await fetch(`/api/admin/reports/download/${id}`, {
-                    headers: { 'Authorization': `Bearer ${this.token}` }
-                });
+                const resp = await this.authFetch(`/api/admin/reports/download/${id}`);
                 if (resp.ok) {
                     const blob = await resp.blob();
                     const url = window.URL.createObjectURL(blob);
@@ -520,30 +657,29 @@ const app = createApp({
             }
         },
         async generateReport() {
+            if (this.reportGenerating) return;
+            // Optimistic feedback: tell the user immediately instead of blocking on a spinner.
+            this.reportGenerating = true;
+            this.showAlert("Report generation started! We'll notify you when it's ready.", 'info');
             const res = await this.api('/api/admin/reports/generate', 'POST');
-            if (res) {
-                this.showAlert('Report generation started! Will download when ready...', 'info');
-                if (res.job_id) {
-                    // poll the job for completion
-                    const pollReport = async () => {
-                        const job = await this.api(`/api/jobs/${res.job_id}`);
-                        if (job && job.status === 'completed') {
-                            this.showAlert('Report ready! Downloading...', 'success');
-                            await this.loadReports();
-                            await this.loadNotifications();
-                            // download the latest report
-                            if (this.reports.length) {
-                                await this.downloadReport(this.reports[0].id);
-                            }
-                        } else if (job && job.status !== 'failed') {
-                            setTimeout(pollReport, 3000);
-                        } else {
-                            this.showAlert('Report generation failed.', 'danger');
-                        }
-                    };
-                    setTimeout(pollReport, 2000);
+            if (!res || !res.job_id) { this.reportGenerating = false; return; }
+            const pollReport = async () => {
+                const job = await this.api(`/api/jobs/${res.job_id}`);
+                if (job && job.status === 'completed') {
+                    this.reportGenerating = false;
+                    this.showAlert('Report ready! Downloading...', 'success');
+                    await this.loadReports();
+                    await this.loadNotifications();
+                    if (this.reports.length) await this.downloadReport(this.reports[0].id);
+                } else if (job && job.status !== 'failed') {
+                    setTimeout(pollReport, 3000);
+                } else {
+                    this.reportGenerating = false;
+                    this.showAlert('Report generation failed. It was sent to the dead-letter queue for review.', 'danger');
                 }
-            }
+            };
+            // ran inline (no worker)? it is already finished - poll right away
+            setTimeout(pollReport, res.mode === 'sync' ? 0 : 2000);
         },
 
         // company actions
@@ -663,6 +799,7 @@ const app = createApp({
         },
         async checkATS(driveId) {
             this.atsResult = null;
+            this.atsFallback = false;
             this.atsLoading = true;
             const modal = new bootstrap.Modal(document.getElementById('atsModal'));
             modal.show();
@@ -670,6 +807,8 @@ const app = createApp({
             this.atsLoading = false;
             if (res) {
                 this.atsResult = res.result;
+                this.atsFallback = !!res.fallback;
+                this.atsRetryMinutes = res.retry_after_minutes || 10;
             }
         },
         async loadMyInterviews() {
@@ -700,24 +839,21 @@ const app = createApp({
             const fd = new FormData();
             fd.append('resume', file);
             try {
-                const res = await fetch(API + '/api/students/upload-resume', {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${this.token}` },
-                    body: fd,
-                });
+                const res = await this.authFetch('/api/students/upload-resume', { method: 'POST', body: fd });
                 const data = await res.json();
                 if (res.ok) this.showAlert('Resume uploaded!', 'success');
                 else this.showAlert(data.error || 'Upload failed', 'danger');
             } catch (e) { this.showAlert('Upload error', 'danger'); }
         },
         async exportCSV() {
+            if (this.exportGenerating) return;
+            this.exportGenerating = true;
+            this.showAlert("Export started! We'll notify you when it's ready.", 'info');
             const res = await this.api('/api/student/export-applications', 'POST');
-            if (res) {
-                this.showAlert('Export started! You will be notified when ready.', 'info');
-                if (res.job_id) this.pollJob(res.job_id);
-            }
+            if (res && res.job_id) await this.pollJob(res.job_id, res.mode === 'sync' ? 0 : 2000);
+            else this.exportGenerating = false;
         },
-        async pollJob(jobId) {
+        async pollJob(jobId, firstDelay = 2000) {
             const poll = async () => {
                 const job = await this.api(`/api/jobs/${jobId}`);
                 if (job && job.status === 'completed') {
@@ -725,9 +861,7 @@ const app = createApp({
                     await this.loadNotifications();
                     // trigger browser download with auth token
                     try {
-                        const resp = await fetch(`/api/student/download-export/${jobId}`, {
-                            headers: { 'Authorization': `Bearer ${this.token}` }
-                        });
+                        const resp = await this.authFetch(`/api/student/download-export/${jobId}`);
                         if (resp.ok) {
                             const blob = await resp.blob();
                             const url = window.URL.createObjectURL(blob);
@@ -740,13 +874,15 @@ const app = createApp({
                             window.URL.revokeObjectURL(url);
                         }
                     } catch (e) { console.error('Download failed:', e); }
+                    this.exportGenerating = false;
                 } else if (job && job.status !== 'failed') {
                     setTimeout(poll, 3000);
                 } else {
+                    this.exportGenerating = false;
                     this.showAlert('Export failed. Please try again.', 'danger');
                 }
             };
-            setTimeout(poll, 2000);
+            setTimeout(poll, firstDelay);
         },
     },
     async mounted() {
@@ -754,25 +890,21 @@ const app = createApp({
         if (this.darkMode) {
             document.documentElement.setAttribute('data-theme', 'dark');
         }
-        if (this.token && this.user.id) {
-            // verify token is still valid
-            try {
+        localStorage.removeItem('ppa_token');          // legacy: tokens are no longer persisted in JS-readable storage
+        if (this.user && this.user.id) {
+            // We remember *who* was logged in; the credential itself is the httpOnly refresh cookie.
+            this.isLoggedIn = true;
+            let ok = false;
+            if (await this.refreshAccessToken()) {
                 const res = await this.api('/api/auth/me');
                 if (res && res.user) {
                     this.user = res.user;
-                    localStorage.setItem('ppa_user', JSON.stringify(res.user));
-                    this.isLoggedIn = true;
+                    this.startLiveNotifications();
                     this.navigate('dashboard');
-                } else {
-                    // token expired or invalid
-                    this.token = '';
-                    localStorage.removeItem('ppa_token');
-                    localStorage.removeItem('ppa_user');
+                    ok = true;
                 }
-            } catch (e) {
-                this.isLoggedIn = true;
-                this.navigate('dashboard');
             }
+            if (!ok) { this.isLoggedIn = false; this.user = {}; localStorage.removeItem('ppa_user'); }
         }
     }
 });

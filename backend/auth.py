@@ -1,29 +1,31 @@
 import jwt
 import uuid
 import datetime
+import logging
 from functools import wraps
 from flask import request, jsonify, current_app
-from models import User
+from models import db, User
+from cache import _call
 
-# In-memory fallback for blacklist when Redis is down (single-web offline mode)
+log = logging.getLogger(__name__)
+
+# In-memory fallback for blacklist when Redis is down (single-process offline mode)
 _blacklisted_memory = {}
 
 
 def _is_blacklisted(jti):
     if not jti:
         return False
-    # Redis check first
-    try:
-        from cache import get_redis
-        r = get_redis()
-        if r and r.exists(f"bl:{jti}"):
-            return True
-    except Exception:
-        pass
+    # Durable state Redis first
+    found, ok = _call('state', lambda r: r.exists(f"bl:{jti}"))
+    if ok and found:
+        return True
+    if not ok:
+        log.warning('blacklist_check_degraded', extra={'event': 'blacklist_check_degraded'})
     # Memory fallback
     exp = _blacklisted_memory.get(jti)
     if exp:
-        if datetime.datetime.utcnow() < exp:
+        if _now() < exp:
             return True
         else:
             _blacklisted_memory.pop(jti, None)
@@ -36,21 +38,20 @@ def blacklist_token(jti, exp):
         return
     # exp may be int timestamp or datetime
     if isinstance(exp, (int, float)):
-        exp_dt = datetime.datetime.utcfromtimestamp(exp)
+        exp_dt = datetime.datetime.fromtimestamp(exp, tz=datetime.timezone.utc)
     else:
-        exp_dt = exp
-    ttl = int((exp_dt - datetime.datetime.utcnow()).total_seconds())
+        exp_dt = exp if exp.tzinfo else exp.replace(tzinfo=datetime.timezone.utc)
+    ttl = int((exp_dt - _now()).total_seconds())
     if ttl <= 0:
         ttl = 3600
-    try:
-        from cache import get_redis
-        r = get_redis()
-        if r:
-            r.setex(f"bl:{jti}", ttl, "1")
-            return
-    except Exception:
-        pass
-    _blacklisted_memory[jti] = datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl)
+    _, ok = _call('state', lambda r: r.set(f"bl:{jti}", "1", ex=ttl))
+    if ok:
+        return
+    _blacklisted_memory[jti] = _now() + datetime.timedelta(seconds=ttl)
+
+
+def _now():
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def generate_token(user):
@@ -58,10 +59,8 @@ def generate_token(user):
         'user_id': user.id,
         'email': user.email,
         'role': user.role,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(
-            seconds=current_app.config['JWT_ACCESS_TOKEN_EXPIRES']
-        ),
-        'iat': datetime.datetime.utcnow(),
+        'exp': _now() + datetime.timedelta(seconds=current_app.config['JWT_ACCESS_TOKEN_EXPIRES']),
+        'iat': _now(),
         'jti': str(uuid.uuid4()),
     }
     token = jwt.encode(payload, current_app.config['JWT_SECRET_KEY'], algorithm='HS256')
@@ -90,7 +89,7 @@ def get_current_user():
     payload = decode_token(token)
     if not payload:
         return None
-    user = User.query.get(payload['user_id'])
+    user = db.session.get(User, payload["user_id"])
     if user and user.is_active and not user.is_blacklisted:
         return user
     return None

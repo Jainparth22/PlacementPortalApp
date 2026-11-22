@@ -1,352 +1,385 @@
 # Placement Portal Application (PPA V5)
 
-> **Production-grade campus placement system** — `Flask REST + Vue 3 SPA + Redis + Celery + Postgres/SQLite + HuggingFace ATS + Railway Volume`
-> **Live:** `https://ppa-v5.fly.dev` · **API Docs:** `/api/docs` (ReDoc) · `/api/swagger` (Swagger UI) · **Spec:** `api.yaml` (53 endpoints) · **Health:** `/health` · **Auth:** `JWT + JTI blacklist` (stateful logout)
+> **Campus placement system** — `Flask REST + Vue 3 SPA + Redis (cache / queue / state) + Celery + PostgreSQL/SQLite + HuggingFace ATS`
+> **Run it:** `docker compose up --build` → <http://localhost:5001> · **API docs:** `/api/docs` (ReDoc), `/api/swagger` · **Spec:** [api.yaml](api.yaml) (OpenAPI, 57 paths, versioned `/api/v1`, contract-tested against the real routes) · **Health:** `/health`
+> **Tests:** `pytest -q` (223 tests, no Redis/Postgres needed) · **CI:** [.github/workflows/test.yml](.github/workflows/test.yml)
 
 ---
 
-## Table of Contents
-- [🎯 For Recruiters — Showcase](#-for-recruiters--showcase)
-  - [1. About Me](#1-about-me)
-  - [2. CS Skills Demonstrated](#2-cs-skills-demonstrated)
-  - [3. Architecture Decisions](#3-architecture-decisions)
-  - [4. Real-World Contributions](#4-real-world-contributions)
-  - [5. Problem Solving Stories](#5-problem-solving-stories)
-  - [6. Testing Guide (What to Notice)](#6-testing-guide-what-to-notice)
-- [Problem & Vision](#problem--vision)
-- [System Design Principles](#system-design-principles)
-- [Architecture — With Fallbacks](#architecture--with-fallbacks)
-- [DB Schema — 12 Tables](#db-schema--12-tables)
-- [Interlinking — Role Lifecycles](#interlinking--role-lifecycles)
-- [Role Deep-Dive](#role-deep-dive)
-- [API — 53 Endpoints + Pagination + Docs](#api--53-endpoints--pagination--docs)
-- [ATS System](#ats-system)
-- [Frontend — 14 Pages + PWA](#frontend--14-pages--pwa)
-- [Pagination](#pagination)
-- [Security — Rate Limiter, Validation, Fallbacks](#security--rate-limiter-validation-fallbacks)
-- [Offline vs Online Run](#offline-vs-online-run)
-- [Project Structure](#project-structure)
-- [Tech Stack & Rationale](#tech-stack--rationale)
-- [Build Commands — Verified](#build-commands--verified)
-- [Demo Credentials (8 Seeded)](#demo-credentials-8-seeded)
-- [Run Locally — Windows](#run-locally--windows)
-- [Deploy to Railway — 3-Service True Async](#deploy-to-railway--3-service-true-async)
-- [Verification](#verification)
-- [Limitations & Roadmap](#limitations--roadmap)
+## Table of contents
+1. [For recruiters](#for-recruiters)
+2. [Quick start](#quick-start)
+3. [Architecture](#architecture)
+4. [Redis: three jobs, three roles](#redis-three-jobs-three-roles)
+5. [Caching — where, how, and what happens when Redis dies](#caching)
+6. [Background jobs (Celery)](#background-jobs-celery)
+7. [Security & sessions](#security)
+8. [Live notifications (outbox → Streams → SSE)](#live-notifications-transactional-outbox--redis-streams--sse)
+9. [File storage](#file-storage)
+10. [Observability (metrics, tracing, dashboards)](#observability)
+11. [Database & migrations](#database--migrations)
+12. [API](#api)
+13. [Testing, load testing, chaos](#testing-load-testing-chaos)
+14. [Deploying](#deploying)
+15. [Configuration](#configuration)
+16. [Project structure](#project-structure)
+17. [Demo accounts](#demo-accounts)
+18. [Limitations & roadmap](#limitations--roadmap)
 
 ---
 
-## 🎯 For Recruiters — Showcase
+## For recruiters
 
-Hi! I'm Parth Jain, a student in the IIT Madras BS program. I built the Placement Portal Application (PPA) because I wanted to solve a real problem on campus, rather than just building another tutorial project.
+I'm Parth Jain, a student in the IIT Madras BS program. I built PPA to solve a real campus problem (spreadsheets, email approvals, no eligibility checks, duplicate applications) and to show that I can design, build, test and harden a multi-role system — not just a CRUD tutorial.
 
-This isn't your standard CRUD app. I built it to demonstrate my ability to design, develop, deploy, and bullet-proof a full-stack, multi-role platform from scratch. 
+**What to look at (in order of effort):**
 
-If you have a few minutes to explore the live link or the codebase, here is a quick guide on what to look for, the technical decisions I made, and how I approached problem-solving.
+| 30 seconds | Where |
+|---|---|
+| Zero-typing login | Click the Admin / TechNova / Kavya pills on the login screen |
+| Approval workflow | Admin → Companies → Approve; company posts a drive; admin approves; student applies |
+| Eligibility rules | Apply with a CGPA/branch/year that doesn't match → rejected; apply twice → `409` |
 
-### 1. Taking Ownership: From Concept to Production
-When building this, my goal was to show that I can take a product through its entire lifecycle. 
-- **End-to-End Delivery:** I handled everything from designing the database schema to writing the API, building the frontend, setting up caching and async queues, and deploying it securely.
-- **Engineering Mindset:** Every tool in the stack was chosen for a specific reason. More importantly, I intentionally built robust fallbacks for critical components so the app doesn't just crash if a service goes down.
-- **User Experience Matters:** I made sure the live app is instantly testable. It's pre-seeded with demo accounts and features a 1-click login so you can jump right in without reading any docs.
+| 5 minutes | Where |
+|---|---|
+| Resilience | `python scripts/chaos_demo.py` kills Redis on purpose; reports still generate (inline), `/health` degrades, recovery is automatic |
+| Cache correctness | `tests/test_browse_cache.py` — regression tests for stale-cache bugs I found and fixed |
+| Async design | `backend/celery_worker.py`, `tasks.py`, `dead_letter.py`, `async_dispatch.py` |
+| Security | `ratelimit.py`, `auth.py` (stateful JWT logout), magic-byte upload check, sanitising, `tests/test_platform.py` |
 
-### 2. Core Engineering Skills Demonstrated
-Here’s where you can see my computer science fundamentals applied in practice:
-
-| Skill | Where to See It | Why It Matters |
-|-------|-----------------|----------------|
-| **System Design** | 12 tables in `models.py`, `UniqueConstraint(student, drive)`, state machines for drives | Shows I know how to model complex, real-world relationships, going way beyond a simple `users` table. |
-| **REST API Architecture** | 53 endpoints in `api.yaml`, consistent pattern (`decorator → validate → query → jsonify`), pagination | Proves I write consistent, predictable, and scalable APIs, rather than ad-hoc scripts. |
-| **Auth & Access Control** | `@role_required` decorators, JWT expiration, **stateful JTI blacklisting** in `auth.py` | Shows a deep understanding of session management and token revocation, not just basic stateless JWTs. |
-| **Security Best Practices** | Input validation, secure file uploads, 5MB file limits, **rate limiting (5/min)** via Redis | Demonstrates maturity in defense-in-depth and protecting infrastructure from abuse. |
-| **Performance Optimization** | Redis Cache-Aside (`cache.py`), global pagination | Shows I build for scale so the database and DOM don't choke under load. |
-| **Asynchronous Processing** | Celery + Beat in `tasks.py` for emails and heavy PDF reports, with a **sync fallback** | Proves I know when to offload heavy tasks to a background worker, and how to gracefully degrade if the worker is down. |
-| **Resilient Data Handling** | Railway Volumes (`/data`), relative paths, ATS gracefully handling missing PDFs | Highlights my understanding of ephemeral filesystems in modern cloud deployments. |
-
-### 3. Architecture Decisions & Fallbacks
-I didn't just pick tools because they are popular; I picked them to solve specific problems. Here is my thought process:
-
-| Decision | Why I Chose It | The Fallback I Built |
-|----------|----------------|----------------------|
-| **Flask over Django** | I wanted explicit control over 53 endpoints using Blueprints, keeping the architecture lean and modular. | — |
-| **Vue 3 CDN over React** | I wanted a reactive SPA without the overhead of a build step (`npm run build`). | — |
-| **Postgres (Prod) + SQLite (Local)** | Railway automatically provisions Postgres for production, while SQLite makes local development zero-setup. | If the `DATABASE_URL` is missing, it safely falls back to local SQLite. |
-| **Redis vs In-Memory** | A true distributed cache is needed for rate-limiting and token blacklisting across multiple workers. | If Redis fails to connect, the app gracefully degrades to an in-memory dictionary so it doesn't crash. |
-| **Celery vs Threading** | Celery provides a true queue for heavy report generation and scheduled reminders. | If Celery/Redis is down, the code catches it and runs the task synchronously so the user still gets their report. |
-| **Railway Volumes** | Heroku-style ephemeral filesystems wipe user uploads on redeploy. I mounted a persistent `/data` volume. | If the volume isn't found, it falls back to a relative `backend/uploads` directory. |
-
-### 4. Problem Solving in the Trenches
-Here are a few real roadblocks I hit during development and how I solved them:
-
-- **The Security Hole:** I realized that standard stateless JWTs remain valid even after a user logs out. 
-  *Fix:* I implemented a stateful logout by generating a unique `jti` (JWT ID) for each token. On logout, the `jti` is stored in Redis with a TTL matching its expiration. The token decoder now checks this blacklist first, guaranteeing a secure `401 Unauthorized` on reuse.
-  
-- **The "Pending Forever" Bug:** When running the app locally without a Celery worker spun up, background tasks would stay pending forever. 
-  *Fix:* I added a check before dispatching tasks. If the broker is unreachable, the application falls back to running the heavy function synchronously directly in the request lifecycle. 
-
-- **The Sleeping AI Model:** The HuggingFace API I used for the ATS resume parsing sleeps after inactivity, causing 20-second timeouts. 
-  *Fix:* I aggressively cached successful ATS results for 10 minutes. If the API times out, I catch the error and return a graceful fallback score based on the user's plain-text profile instead of throwing a `500 Server Error`.
-
-### 5. A Guide to Testing the Live App
-If you'd like to test the app, here are a few things to try out, ranging from obvious UI features to subtle backend safety checks.
-
-**The Quick Tour (30 Seconds)**
-1. **Zero-Typing Login:** On the login screen, click the "Admin", "TechNova", or "Kavya" pills. It will auto-fill the credentials. Click Login. 
-2. **The Look and Feel:** Notice the custom emerald theme, the dark mode toggle in the header, and the smooth floating toast alerts.
-3. **Demo Modal:** Click "View all 8 accounts" to see a quick modal of all seeded users with 1-click copy buttons.
-
-**Digging Deeper (2 Minutes)**
-4. **Admin Approval Flow:** Go to Companies -> Approve/Reject. Notice how the cache invalidates instantly and the lists update across the app.
-5. **Data Protections:** Log in as a Company and try to edit a Placement Drive that has already been marked 'Closed'. The API will block it.
-6. **Smart Validation:** Log in as a Student and apply for a drive. If your CGPA doesn't meet the drive's cutoff, the API actively rejects the application. 
-
-**The Subtle Engineering Details**
-7. **Rate Limiting:** Try rapidly clicking the Login button 6 times with a wrong password. You'll hit my custom `429 Too Many Requests` rate limiter.
-8. **File Guardrails:** Go to Profile -> Resume and try uploading a `.docx` file. The backend explicitly rejects it (`400 Bad Request`), strictly enforcing a 5MB PDF-only policy.
-9. **Asynchronous Polling:** As an Admin, go to Reports -> Generate. Watch the UI automatically poll the `/jobs/<id>` endpoint every 3 seconds until the backend finishes generating the PDF and serves the download. 
-10. **Stateful Logout:** Log out, then try to manually hit an API endpoint with your old Bearer token in Postman. The server will reject it immediately because the token ID was added to the Redis blacklist.
-11. **API Documentation:** Hit `/api/docs` in your browser. You'll see a complete, auto-generated ReDoc page powered by my `api.yaml` specification.
-
-### 6. The 30-Second Elevator Pitch
-"I built a 53-endpoint campus placement system that’s actually demo-ready: it has 8 seeded accounts, 1-click login, strict PDF-only resume guards, eligibility checks, global pagination, IP rate limiting, and JTI-blacklisted logouts. It runs on a Redis cache with three distinct fallback layers, a Celery task queue that gracefully degrades to synchronous execution, and a Volume-aware storage system. You can test the AI resume parser, or try to break the app—going to `page=999` returns an empty list rather than crashing, duplicate applications throw a 409, and the health check stays green even if the cache goes down."
+**Engineering stories (problems I hit and fixed):**
+- **Stateless JWT logout hole** → every token carries a `jti`; logout stores it in Redis with a TTL equal to the token's remaining life; the decoder rejects blacklisted tokens.
+- **"Pending forever" jobs** → the old code only checked whether Redis was up. Now a task is queued only if a Celery worker actually answers a ping (cached 15 s); otherwise it runs inline.
+- **Stale cache** → approving a drive deleted key `approved_drives` but the cache stored `approved_drives_paginated`, so the student list never refreshed. Replaced by namespace-versioned keys (`invalidate("drives")`) with regression tests.
+- **Cache that never hit** → the ATS cache key used Python's `hash()`, which is randomised per process. Now SHA-256.
+- **Permanent lock-out bug** → the rate limiter did `INCR` then `EXPIRE` as two calls; a crash in between left a counter with no expiry. Now one atomic `MULTI/EXEC`.
+- **Spoofable rate limit** → it trusted `X-Forwarded-For` from the client. Now it uses the socket address and only trusts N configured proxy hops.
+- **Beat schedule that never fires** → "every 30 days" interval schedules restart whenever beat restarts. Replaced with `crontab`.
+- **Secrets in git** → removed from `config.py`; production refuses to boot without real secrets.
 
 ---
 
-## Problem & Vision
-**Problem:** Spreadsheets, email approvals, no eligibility (CGPA/branch/year), duplicate applies, no ATS, no unified Admin/Company/Student view.
-**Vision:** One auditable `Company(pending→approved) → Drive(pending→approved) → Student(browse→apply→eligible+unique→Company shortlist→Interview→History) → Admin reports` via **stateless JWT**, **cached**, **paginated (6/page)**, **rate-limited**, **async where slow**, with **fallbacks** for offline demo.
+## Quick start
 
----
-
-## System Design Principles
-
-> **Every route follows the pattern:** `decorator → get data → validate → query → return jsonify` *(from `Startup.txt:42` — consistent across all 53 endpoints in `admin.py`/`company.py`/`student.py`/`app.py`)*
-
-| Principle | Application |
-|-----------|-------------|
-| **Uniform Route Pattern** | **`decorator → get data → validate → query → return jsonify`** — every handler: `@role_required`/`@login_required` → `request.json/args` → `validators.py` → `query` → `jsonify` (e.g., `student.py:228` `apply_for_drive`, `admin.py:79` `list_companies`, `company.py:162` `list_company_drives`) |
-| **Separation of Concerns** | `backend/` JSON only (`app.py:17` factory, blueprints `admin.py:9` `company.py:9` `student.py:11`), `frontend/` Vue SPA only |
-| **REST + Stateful JWT (JTI blacklist)** | `decorator→validate→query→jsonify`, `@role_required` `auth.py:47`, `exp 3600` `config.py:40`, `jti:uuid4` `auth.py:32` → `POST /api/auth/logout` `app.py:188` blacklists `bl:<jti> TTL=exp-now` (Redis `setex` or in-memory fallback `_blacklisted_memory`), `decode_token` `auth.py:52` rejects blacklisted even if not expired |
-| **Single-Table Inheritance** | `User.role` + `StudentProfile`/`CompanyProfile` (`models.py:7`) |
-| **Normalized + FK Cascades** | 12 tables, `Unique(student,drive)` `models.py:158`, `cascade delete-orphan` |
-| **Cache-Aside** | `cache.py:31` Redis singleton, `admin_stats 300s`, `approved_drives_paginated 600s`, fallback `None` |
-| **Async-Where-Slow** | Celery `export/report/reminders` `tasks.py:35` + Beat, fallback sync if Redis down `admin.py:313` `student.py:367` |
-| **Pagination Everywhere** | `pagination.py:4` `{items,total,pages}` on 12 lists `?page&per_page` (6, max 50), `app.js:166` `pg` meta |
-| **Fail-Safe** | ATS `PyPDF2→profile fallback` `student.py:433`, storage relative paths + Volume `/data` |
-| **Rate-Limited** | `app.py:103` `5/min per IP` `POST /api/auth/login` via Redis `INCR ratelimit:login:<ip> 60s` or in-memory `_login_attempts`, `429 Too many` |
-| **12-Factor** | Env `DATABASE_URL/REDIS_URL/UPLOAD_FOLDER/PORT`, `railway.json`, `Dockerfile` `/data`, `AUTO_SEED` |
-
----
-
-## Architecture — With Fallbacks
-```mermaid
-graph TD
-  Browser[Vue 3 SPA<br/>app.js + index.html]
-  Browser -- Bearer JWT<br/>app.js:138 --> API[Flask API<br/>app.py:create_app]
-  API -- Blueprints --> Admin[admin.py 18]
-  API -- Blueprints --> Company[company.py 10]
-  API -- Blueprints --> Student[student.py 12]
-  API -- ORM --> DB[(Postgres Railway<br/>↔ SQLite local<br/>config.py:_get_database_uri)]
-  API -- Cache --> Redis[(Redis)]
-  Redis -- fallback: None<br/>cache.py:31 --> API
-  API -- Queue --> Celery[Celery+Beat<br/>celery_worker.py]
-  Celery -- tasks --> Tasks[tasks.py<br/>report/CSV/reminders]
-  Tasks -- fallback: sync<br/>admin.py:313 --> API
-  API -- Storage --> Volume[/data/uploads<br/>Volume /data<br/>fallback: backend/uploads]
-  API -- HF --> HF[HF Space parthjain/ResumeAnalyser]
-  HF -- sleep fallback --> ATS[ATS fallback text<br/>student.py:470]
-  API -- RateLimit --> RL[5/min IP<br/>app.py:103]
-  API -- Health --> Health[/health<br/>db+redis]
-  API -- Logout --> Blacklist[(JTI Blacklist<br/>Redis bl:<jti> TTL<br/>or memory<br/>auth.py:32)]
-  Browser -- Docs --> DocsRoute[/api/docs ReDoc<br/>/api/swagger<br/>/api/openapi.yaml]
-  style Redis fill:#fee,stroke:#f00,stroke-dasharray: 5 5
-  style Celery fill:#efe,stroke:#0a0,stroke-dasharray: 5 5
+**Docker (recommended)** — brings up web, worker, beat, PostgreSQL and two Redis instances:
+```bash
+docker compose up --build                 # http://localhost:5001
+docker compose --profile monitoring up    # + Flower (task monitor) on :5555
+docker compose run --rm web seed          # reset demo data
 ```
 
-**Fallbacks denoted dashed:**
-- **Redis down** → `cache_get None`, reports/exports run **sync** `admin.py:313`, rate limiter uses in-memory dict, JTI blacklist uses memory `_blacklisted_memory`
-- **HF sleeping** → `student.py:470` returns fallback text `ATS temporarily unavailable` + `200` not `500`, cached `600s`
-- **Volume missing** → `UPLOAD_FOLDER` fallback to `backend/uploads`, ATS uses profile `Name/Skills/CGPA`
-- **Celery worker missing (single-web)** → job runs sync, `202` still completes (was `pending forever` before fix)
-- **Logout** → was stateless (token valid 1h), now **stateful** `app.py:188` `bl:<jti>` until `exp` — `decode_token` `auth.py:52` rejects blacklisted
-
----
-
-## DB Schema — 12 Tables
-```mermaid
-erDiagram
-  User ||--o| StudentProfile : "1-1"
-  User ||--o| CompanyProfile : "1-1"
-  User ||--o{ Notification : "1-N"
-  User ||--o{ AsyncJob : "1-N"
-  CompanyProfile ||--o{ PlacementDrive : "1-N"
-  PlacementDrive ||--o{ Application : "1-N"
-  PlacementDrive ||--o{ DriveApproval : "1-N"
-  StudentProfile ||--o{ Application : "1-N"
-  StudentProfile ||--o{ Skill : "1-N"
-  StudentProfile ||--o{ PlacementHistory : "1-N"
-  Application ||--o{ Interview : "1-N"
-  User { int id PK; string email UK; string role; bool is_active; }
-  StudentProfile { int user_id FK; string full_name; float cgpa; string resume_path; }
-  CompanyProfile { int user_id FK; string company_name; string approval_status; }
-  PlacementDrive { int company_id FK; string drive_name; string status; }
-  Application { int student_id FK; int drive_id FK; string status; UK(student,drive); }
-```
-
-`backend/models.py:1` — `User` single-table, `StudentProfile.resume_path` relative, cascades.
-
----
-
-## Interlinking — Role Lifecycles
-```
-Company Register → pending → Admin approve → Notify → Company POST drive → pending → Admin approve → cache_delete → Student browse (paginated, cached) → Apply (4 checks+unique) → Notify Company → Company GET apps paginated → PUT status → selected→History+Notify → schedule Interview → result → Notify → Student history/interviews/ATS/export → Admin reports generate→Celery→PDF→Notify+Email+GChat → download
-```
-**State Machines:** `Company pending→approved/rejected→blacklist`, `Drive pending→approved/rejected→closed` (edit blocked `company.py:247`), `Application applied→shortlisted→selected/rejected→withdrawn`, `Interview pending→passed/failed`.
-
----
-
-## Role Deep-Dive
-**Admin 18** `routes/admin.py:1`: Dashboard 8 stats+2 charts `admin.py:13` cached, Companies `?status&page` approve/reject/blacklist + search `ilike limit20`, Drives `?status` + detail `drive_id`, Students deactivate/blacklist, Applications `?status&drive_id`, Reports paginated `generate→poll /jobs → download`.
-
-**Company 10** `routes/company.py:1`: Register validated `email/password/phone/url`, Dashboard `total_drives/applicants`, Drives CRUD paginated (edit blocked `closed/rejected` `company.py:247`, delete blocked if apps), Applications paginated → status → History, Interview `schedule`/`result`, Interviews list paginated.
-
-**Student 12** `routes/student.py:1`: Register, Drives `?search&branch&page` cached, Detail `already_applied`, Apply 4 checks+unique `student.py:237`, My Apps paginated+withdraw, Interviews/History paginated, Upload PDF `secure_filename` `resume_<id>` → relative `student.py:166`, ATS, Export async→poll.
-
----
-
-## API — 53 Endpoints + Pagination + Docs
-**Paginated 12** → `{items,total,pages,page,per_page}` `pagination.py:4` (`?page=1&per_page=6` max 50) `app.js:181` unwrap.
-
-| Group | Endpoints (★ paginated) |
-|-------|------------------------|
-| **Auth 3** | `POST /api/auth/login` *(rate-limited 5/min)*, `POST /api/auth/logout`, `GET /api/auth/me` |
-| **Notify/Jobs 4** | `GET /api/notifications`★, `PUT /read`, `PUT /read-all`, `GET /api/jobs/<id>` |
-| **Admin 18** | `GET /dashboard` cached, `GET /search`, `GET /companies`★, `pending`, `PUT approve/reject/blacklist`, `GET /drives`★, `pending`, `PUT approve/reject/close`, `GET /students`★, `PUT deactivate/blacklist`, `GET /applications`★, `GET /reports/monthly`★, `POST /reports/generate`→202, `GET /download/<id>` |
-| **Company 10** | `POST /companies/register`, `GET/PUT /companies/profile`, `GET /company/dashboard`, `GET /company/drives`★ `POST`, `PUT/DELETE /drives/<id>`, `GET /drives/<id>/applications`★, `PUT /status`, `POST /schedule-interview`, `PUT /interview-result`, `GET /drives/<id>/interviews`★ |
-| **Student 12** | `POST /students/register`, `GET/PUT /students/profile`, `POST /students/upload-resume` PDF, `GET /student/drives`★, `GET /drives/<id>`, `POST /apply/<id>`, `GET /applications`★, `PUT /withdraw`, `GET /history`★, `GET /interviews`★, `POST /export`→202, `GET /download-export/<id>`, `POST /ats-check` |
-
-**Interesting `api.yaml` use — no extra deps:** `backend/app.py:217` adds `GET /api/openapi.yaml` (serves file), `GET /api/docs` (ReDoc CDN), `GET /api/swagger` (Swagger UI CDN). Open `https://your-ppa.up.railway.app/api/docs` to browse 53 endpoints (import `api.yaml` in Postman/Swagger too). `GET /health` for Railway healthcheck.
-
----
-
-## ATS System
-1. Build JD `job_title+description+branch+cgpa` `student.py:421`
-2. Resolve resume `UPLOAD_FOLDER/basename` + fallback `student.py:433` `Name/Dept/CGPA/Skills/Bio` (works without PDF)
-3. `gradio_client` `parthjain/ResumeAnalyser` `student.py:468` → cached `cache_get f"ats:{id}:{drive}:{hash}" 600s` `student.py:460`, fallback `200` on HF sleep `student.py:470`
-4. Matrix `sample_test_data.md:342` `Kavya Intern 90% HIGH`, `Arjun Analyst 15% LOW`
-
----
-
-## Frontend — 14 Pages + PWA
-Vue 3 CDN `app.js:6` `currentPage` routing, Bootstrap 5, Chart.js. Pages: Login+ demo pills `fillDemo()` `app.js:336`, Admin Dashboard 8 cards+charts `renderAdminCharts`, Companies/Drives/Students/Applications/Reports (+detail), Company Dashboard/Drives/Profile/DriveApps, Student Dashboard/Drives/Detail/Apps/Interviews/History/Profile. Global pagination bar `index.html:1235`.
-
----
-
-## Pagination
-**Why:** Without, `GET /companies` fetched all → slow DOM. **Backend** `pagination.py:4` `paginate(error_out=False)` uniform. **Frontend** `pg` meta per list, `goPage` `app.js:191`, global bar `index.html:1235`. Clients `?page=2&per_page=6`. Extra seed 8 companies (was 2) `SampleDataSeed.py:371` makes bar visible.
-
----
-
-## Security — Rate Limiter, Validation, Fallbacks
-- **Rate Limiter (NEW):** `app.py:103` `POST /api/auth/login` `5/min per IP` → `429` via Redis `INCR ratelimit:login:<ip> 60s` or in-memory fallback (`_login_attempts`). Shows maturity, prevents brute force.
-- **Validation:** `validators.py` `email/password 6+`, `phone`, `cgpa 0-10`, `year`, `url`, `name` + client `was-validated`.
-- **Auth:** `Werkzeug hash`, `secure_filename`, `5MB`, `is_active/blacklisted` `auth.py:42`, `HS256 1h`, `CORS *`, JWT required `Bearer`.
-- **Secrets:** `config.py:32` `_require_env()` fails hard in `RAILWAY_ENVIRONMENT`/`FLASK_ENV=production` if `SECRET_KEY/JWT/ADMIN_PASSWORD` missing (no weak fallback), `.env` gitignored `RILWAY`, must set Railway Variables.
-- **Fallbacks:** As per architecture diagram.
-
----
-
-## Offline vs Online Run
-| Mode | How | Async | What happens |
-|------|-----|-------|--------------|
-| **Offline (Windows, single `web`)** | `Startup.txt` `python app.py` + optional `docker redis` | **Sync fallback** `admin.py:313` `student.py:367` detects `Redis==None` → runs `generate_monthly_report(job.id)` / `export_csv(...)` directly, `202` completes immediately, no polling forever. ATS falls back to profile text if PDF missing. Works without `worker`/`beat`. | For local dev, offline demo, recruiter quick test without 3 services |
-| **Online (Railway, 3-service true async)** | `web` + `worker` (`celery worker --pool solo`) + `beat` + Redis+Postgres plugins, Volume `/data` | **True async** `delay()` enqueues to Redis → worker picks `5 interviews` etc., `GET /jobs/<id>` polls `3s` `app.js:650`, Beat `daily-reminders`/`monthly-report` cron | For production, concurrent, persistent, charts live |
-
-Set `AUTO_SEED=1` auto-seeds if empty (8 companies now), `AUTO_SEED=0` to disable.
-
----
-
-## Project Structure
-```
-PPA/
-├── backend/
-│   ├── app.py               # + /health + /api/docs + rate limiter + AUTO_SEED
-│   ├── config.py            # _require_env() prod fail, _get_database_uri, Volume /data
-│   ├── models.py            # 12 models
-│   ├── pagination.py        # paginate_query()
-│   ├── auth.py              # jwt + decorators
-│   ├── cache.py             # Redis singleton
-│   ├── validators.py
-│   ├── celery_worker.py     # REDIS fallback
-│   ├── tasks.py             # sync fallback email check
-│   ├── SampleDataSeed.py    # 8 companies (was 2) for pagination
-│   ├── routes/*.py          # + sync fallbacks
-│   └── instance/ppa.db
-├── frontend/
-│   ├── templates/index.html # demo pills + global pagination
-│   └── static/js/app.js     # pg, rate-limit handling
-├── api.yaml                 # 53 + BearerAuth (served at /api/openapi.yaml)
-├── seed.py                  # wrapper python seed.py (replaces 2 scripts, kept 1)
-├── requirements.txt         # + psycopg2-binary
-├── Procfile                 # workers 1 (free) — verified
-├── Dockerfile               # 3.11-slim + /data — verified
-├── railway.json             # nixpacks + workers 1 — verified
-├── .env                     # gitignored, paste to Railway
-├── .env.example
-└── sample_test_data.md      # 5 resumes + ATS matrix (PDFs in Sample Resumes/*.pdf)
-```
-
----
-
-## Tech Stack & Rationale
-`Flask` minimal REST, `SQLAlchemy2 paginate`, `Postgres↔SQLite`, `Redis`, `Celery`, `Vue3 CDN`, `Bootstrap5`, `xhtml2pdf`, `PyPDF2+gradio_client`, `gunicorn 1 worker`.
-
----
-
-## Build Commands — Verified
-| Builder | Build | Deploy | When |
-|---------|-------|--------|------|
-| **Nixpacks** (default) | `pip install -r requirements.txt` `railway.json:5` | `gunicorn --chdir backend --workers 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT app:app` `railway.json:8` `Procfile:5` | Railway auto, fast |
-| **Dockerfile** | `FROM python:3.11-slim + build-essential libpq-dev` `Dockerfile:10` → `pip install` | Same `CMD` `Dockerfile:29` | `Settings → Build → Dockerfile` |
-| **Worker** | — | `celery --workdir backend -A celery_worker worker --pool solo --concurrency=1` `Procfile:7` | Separate service |
-| **Beat** | — | `celery --workdir backend -A celery_worker beat` `Procfile:10` | Separate service |
-Precedence: Service `Start Command` > `railway.json` > `Procfile` > `Dockerfile CMD`. All verified `python -m py_compile`.
-
----
-
-## Demo Credentials (8 Seeded)
-`backend/SampleDataSeed.py:39` auto on first boot. `seed.py` wrapper for manual `python seed.py`.
-
-| Admin `jainparth7040@gmail.com`/`admin123` | TechNova `hr@technova.com`/`Tech@123` | GreenLeaf `careers@greenleaf.com`/`Green@123` | Rahul `rahul...`/`Rahul@123` CSE 8.5 | Kavya `kavya...`/`Kavya@123` 9.1 STAR | +3 more +6 extra pagination demo |
-
----
-
-## Run Locally — Windows
+**Native (Windows/macOS/Linux)** — see [Startup.txt](Startup.txt). The short version:
 ```powershell
-python -m venv .venv; .\.venv\Scripts\Activate; pip install -r requirements.txt
-docker run -d --name redis-server -p 6379:6379 redis
-cd backend; python app.py # :5001
-# T3 worker, T4 beat, T5 cloudflared as Startup.txt, or single-web works via sync fallback
-python seed.py # if not auto-seeded
+python -m venv .venv; .\.venv\Scripts\Activate; pip install -r requirements-dev.txt
+cd backend; python app.py                 # SQLite, migrations + demo data applied on first boot
+```
+Redis, the worker and beat are all optional locally: without Redis the app uses an in-process cache and runs "async" jobs inline.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Browser["Vue 3 SPA<br/>(Bootstrap, Chart.js, PWA)"] -- "/api/v1 + Bearer JWT" --> Web["Flask + gunicorn<br/>3 blueprints"]
+  Web --> DB[("PostgreSQL<br/>SQLite in dev<br/>Alembic migrations")]
+  Web -- "cache-aside<br/>versioned keys" --> RC[("redis-cache<br/>allkeys-lru, no persistence")]
+  Web -- "blacklist, rate limits,<br/>locks, DLQ" --> RQ[("redis-queue<br/>AOF + noeviction")]
+  Web -- "enqueue only if a<br/>worker answers ping" --> RQ
+  RQ -- tasks --> Worker["Celery worker<br/>acks_late, retries+backoff"]
+  Beat["Celery beat<br/>crontab"] --> RQ
+  Worker --> DB
+  Worker -- "permanent failure" --> DLQ["ppa:dead_letter<br/>(list in redis-queue)"]
+  Worker --> Files[("/data volume<br/>resumes, reports, exports")]
+  Web --> Files
+  Web -- "ATS (cached 10 min)" --> HF["HuggingFace Space<br/>parthjain/ResumeAnalyser"]
+  Flower["Flower"] -.-> RQ
+  Web -. "Redis down" .-> Mem["in-process TTL/LRU cache<br/>+ inline task execution"]
+```
+
+Every route follows `decorator → get data → validate → query → jsonify`. Roles: **Admin** (approve companies/drives, reports, user moderation), **Company** (drives, applications, interviews), **Student** (browse, apply, interviews, history, ATS check, CSV export).
+
+State machines: `Company pending→approved/rejected` · `Drive pending→approved/rejected→closed` (closed/rejected drives can't be edited) · `Application applied→shortlisted→selected/rejected→withdrawn` · `Interview pending→passed/failed`. `UniqueConstraint(student, drive)` makes duplicate applications impossible even under a race (the second request gets `409`).
+
+---
+
+## Redis: three jobs, three roles
+
+Redis does three different jobs that need **opposite** guarantees, so they're separated ([config.py](backend/config.py), [docker-compose.yml](docker-compose.yml)):
+
+| Role | Env var | Holds | Policy |
+|---|---|---|---|
+| **cache** | `REDIS_URL` (DB 0) | cached API payloads | `maxmemory` + `allkeys-lru`, no persistence — losing it is free |
+| **broker** | `CELERY_BROKER_URL` (DB 1) | Celery queue | AOF `everysec`, `noeviction` — evicting a queued job loses work |
+| **state** | `STATE_REDIS_URL` (DB 2) | JWT blacklist, rate-limit counters, idempotency locks, dead-letter list | same instance as the broker: an evicted blacklist entry would silently un-revoke a token |
+
+Client library: **redis-py 6+ with `hiredis`** (C protocol parser), one connection pool per role, socket timeouts, TCP health checks, `Retry(ExponentialBackoff)` for transient errors, and a small **circuit breaker** — after a connection failure a role is skipped for 5 s so requests don't each wait out a connect timeout. (The previous code `PING`ed Redis before *every* command.)
+
+---
+
+## Caching
+
+Implementation: [backend/cache.py](backend/cache.py). Tests: `tests/test_cache.py`, `tests/test_browse_cache.py` (every test runs against both the in-memory fallback and a fake Redis).
+
+**What is cached**
+
+| Data | Key namespace | TTL | Invalidated by |
+|---|---|---|---|
+| Admin dashboard stats | `stats` | 5 min | any registration, approval, drive/application change, report |
+| Student "browse drives" — **every** filter/page combination | `drives` | 5 min | drive approved/closed/edited/deleted, company renamed, seed |
+| Company dashboard (per company) | `cdash<company_id>` | 2 min | that company's drives/applications change |
+| ATS result (per student+drive+resume hash) | `ats` | 10 min | expiry only; fallbacks are **never** cached |
+
+**How it works**
+- **Cache-aside with stampede protection** — `cache_get_or_set(key, loader)`: on a miss one caller takes a short `SET NX` lock and rebuilds; concurrent callers wait briefly for it instead of hammering Postgres.
+- **Namespace versioning, one round trip** — entries live at `ppa:<CACHE_KEY_VERSION>:<namespace>:<params>` and store `{"v": <namespace token>, "d": data}`. A read is a single pipelined `GET token` + `GET entry`; the entry is valid only if its token matches. `invalidate("drives")` replaces the token: O(1), no `KEYS`/`SCAN`, instantly effective. Bump `CACHE_KEY_VERSION` to drop everything after changing a payload shape.
+- **Race-safe writes** — the token is read *before* the loader runs and stored with the result, so a value computed across an invalidation is never served as fresh.
+- **Eviction-safe** — tokens are timestamps and are re-minted with `SET NX` if Redis evicts them (the cache instance is `allkeys-lru`), so eviction can't resurrect stale entries.
+- **Outage-safe** — an invalidation that can't reach Redis is remembered and replayed on reconnect (otherwise entries cached before the outage would come back as "fresh"). While degraded, the per-process memory copy is capped at 30 s because other workers can't see this process's invalidations.
+- **Safe lock release** — the stampede lock is only deleted by its owner.
+- **Every key has a TTL** (hard cap 6 h, ±10 % jitter to avoid synchronized expiry). `scripts/redis_ttl_audit.py` verifies this on a live Redis.
+- **Dashboard queries** were rewritten from ~20 `COUNT`s (and 1+N for the company view) to a few `GROUP BY`s.
+- `Cache-Control: no-store` on every `/api/*` response, so browsers/proxies never serve stale API data; the service worker doesn't cache the API either.
+- Hit rate and backend are visible at `/health` and `GET /api/v1/admin/cache-stats`.
+
+**Fallbacks (nothing crashes)**
+1. Redis down → bounded in-process TTL/LRU cache (per process, so only a performance degradation).
+2. Rate limiter → atomic Redis counter, else in-memory counters.
+3. JWT blacklist → Redis (shared across workers), else in-memory (single process; fail-open is documented below).
+4. Tasks → Celery if a worker is alive, else run inline.
+5. HuggingFace asleep → `200` with a clearly flagged basic analysis (UI shows a warning banner) instead of a `500`.
+
+---
+
+## Background jobs (Celery)
+
+[backend/celery_worker.py](backend/celery_worker.py) · [tasks.py](backend/tasks.py) · [async_dispatch.py](backend/async_dispatch.py) · [dead_letter.py](backend/dead_letter.py)
+
+- **Dispatch** (`dispatch(task, ...)`): queue it only if the broker is reachable *and* a worker answers a ping; otherwise run inline. Response includes `"mode": "queued" | "sync"`; the UI polls `GET /api/v1/jobs/<id>` either way.
+- **Reliability**: `acks_late` + `reject_on_worker_lost` (a crashed worker's task is re-queued), `visibility_timeout=2h` (longer than the longest task, so nothing is run twice by redelivery), `prefetch_multiplier=1`, `task_time_limit=600`, `task_ignore_result` (job state lives in the `AsyncJob` table).
+- **Retries**: transient errors (DB/Redis/network/disk) retry with exponential backoff (60 s, 120 s, 240 s…, max 3). Programming errors don't retry.
+- **Dead-letter queue**: a task that exhausts retries or fails permanently is pushed to the Redis list `ppa:dead_letter` (capped at 1000). Inspect with `GET /api/v1/admin/dead-letters`, replay with `POST /api/v1/admin/dead-letters/<task_id>/replay`.
+- **Idempotency**: reminders are one-per-student-per-drive (checked before inserting), a monthly report upserts its row and e-mails the admin at most once per day (`SET NX` guard), exports use a deterministic filename per job and a completed job is a no-op. So redelivery, retries and double clicks are harmless.
+- **Schedules** are `crontab` (daily reminders 08:00 IST, monthly report on the 1st) — not interval schedules, which reset whenever beat restarts.
+- **Graceful shutdown**: on `SIGTERM` the worker does a warm shutdown — it stops consuming and finishes the running task. Compose gives the worker a 60 s grace period.
+- **Monitoring**: Flower (`docker compose --profile monitoring up`, port 5555).
+- **Redis persistence**: the queue instance runs `appendonly yes` / `appendfsync everysec` so a Redis crash loses at most ~1 s of queued messages.
+
+---
+
+## Security
+
+| Control | Where |
+|---|---|
+| Password hashing (Werkzeug) + constant-ish login timing (dummy hash for unknown users) | `app.py` |
+| Access JWT (HS256, **15 min**, `jti`) kept **in JS memory, not localStorage**; **rotating refresh token** in an `httpOnly; SameSite=Strict; Secure` cookie, only its hash stored, **reuse detection** revokes the whole session family; **double-submit CSRF** + Origin check on cookie endpoints | `sessions.py`, `app.py` |
+| **Stateful logout**: access-token `jti` blacklisted in Redis with TTL; refresh family revoked; "log out everywhere" | `auth.py`, `app.py` |
+| **`Idempotency-Key`** on creating POSTs: retries return the original response, same key + different body → `422`, concurrent duplicate → `409` | `idempotency.py` |
+| Role decorators (`@role_required`) on every protected route; ownership checks on company/student resources | `auth.py`, `routes/*` |
+| Login rate limit: per IP (20/min) **and** per account (10 failed/min) | `ratelimit.py`, `app.py` |
+| Per-user limits on expensive endpoints (report, export, ATS: 10/min) | `@rate_limit` |
+| Client IP = socket address; `X-Forwarded-For` only trusted for `TRUSTED_PROXY_COUNT` hops | `app.py` |
+| Input sanitising (tags and control characters stripped) on all free-text fields; HTML e-mails escape values | `validators.clean_text` |
+| Upload: PDF only, 5 MB, `secure_filename`, **magic-byte check** (`%PDF-`) so a renamed `.exe` is rejected | `routes/student.py` |
+| SQL injection: ORM / bound parameters only; a test fails the build if raw SQL string-building appears | `tests/test_platform.py` |
+| CORS off by default (same-origin SPA); allow-list via `CORS_ORIGINS` | `config.py` |
+| Production refuses to boot without `SECRET_KEY`, `JWT_SECRET_KEY`, `ADMIN_PASSWORD`; no secrets in git | `config.py` |
+| Unhandled errors → JSON 500 with a `request_id` (no stack traces to clients) | `app.py` |
+
+Known trade-off: if the state Redis is unreachable at the moment of a request, the blacklist check **fails open** (a revoked-but-unexpired access token would be accepted for up to its remaining ≤15 min life). A warning is logged. For stricter environments make that path fail closed.
+
+### Sessions in detail ([backend/sessions.py](backend/sessions.py))
+```
+login ──► access JWT (15 min, in memory)  +  Set-Cookie ppa_refresh (httpOnly)  +  ppa_csrf (JS-readable)
+ …15 min later, any call gets 401 → SPA calls POST /auth/refresh (cookie + X-CSRF-Token header)
+refresh ─► NEW access JWT  +  NEW refresh cookie; old refresh token marked "used"
+replay of a used token (outside a 10 s grace for two-tabs races) ─► whole family revoked ─► re-login everywhere
+```
+Why: a stolen *access* token dies in ≤15 min; the long-lived credential is unreadable by JavaScript (XSS can't exfiltrate it); a stolen *refresh* token is detected the first time both the thief and the victim use it. The frontend refreshes proactively at 80 % of the token lifetime and transparently retries a 401 once (reusing the same `Idempotency-Key`).
+
+---
+
+## Live notifications (transactional outbox → Redis Streams → SSE)
+
+[backend/events.py](backend/events.py)
+
+```
+business change ─┬─ INSERT notification ┐ same DB transaction
+                 └─ INSERT outbox_event ┘   (no "DB says yes, event lost" window)
+                          │  relay: right after commit (~ms)  +  Celery beat every 30 s (safety net)
+                          ▼
+        Redis Stream  ppa:notif:<user>  (capped, expiring)   +   ppa:events (global audit log)
+                          │  XREAD BLOCK
+                          ▼
+        GET /api/v1/notifications/stream  (Server-Sent Events, id = stream id, resumable via Last-Event-ID)
+                          ▼
+        SPA: toast + bell badge  (de-duplicates by notification id; falls back to 30 s polling if the stream is down)
+```
+- **At-least-once** delivery by design (publish, then mark published) → consumers de-duplicate. Exactly-once is not achievable cheaply; idempotent consumers are.
+- **Redis down?** events stay in the outbox (nothing lost) and are relayed when it returns; clients poll meanwhile. **Redis not configured?** an in-process stream keeps the feature working in dev.
+- **Capacity**: every open stream holds a worker thread, so `SSE_MAX_CONNECTIONS` caps it per process (`503 stream_full` → client polls), gunicorn runs `gthread` with many threads, and streams are recycled every `SSE_MAX_SECONDS`. For thousands of concurrent users move SSE to an async worker class or a dedicated service.
+
+---
+
+## File storage
+
+[backend/storage.py](backend/storage.py) · full explanation in [docs/STORAGE.md](docs/STORAGE.md)
+
+Uploads, reports and exports go through a `Storage` interface (`local` | `s3` — AWS S3 / Cloudflare R2 / MinIO | `azure` Blob). The database stores **keys** (`resumes/resume_3_cv.pdf`), not machine-specific paths, so web replicas and Celery workers on different hosts see the same files. `scripts/migrate_storage.py` moves existing files; legacy path values keep resolving on the local backend.
+
+---
+
+## Observability
+
+- **Structured JSON logs** in production (`LOG_JSON=1`): `{"ts","level","logger","request_id","event":"hf_api_fallback","student_id":123,"reason":"timeout"}` via `log_event()`. Dev logs are human-readable. Level defaults: `DEBUG` in development, `WARNING` in production (`LOG_LEVEL` overrides).
+- **Request IDs**: every request gets (or accepts a sane client-supplied) `X-Request-ID`, echoed in the response, attached to every log line and propagated into Celery task headers so one user action can be traced across web → queue → worker.
+- **`X-Response-Time`** header; requests slower than 1 s log a `slow_request` event.
+- **`/health`**: database, both Redis roles, Celery worker count and mode (`async` / `sync-fallback`), cache hit-rate. `503` only if the database is down.
+- **Sentry**: set `SENTRY_DSN` (Flask + Celery integrations, no PII).
+- **Flower** for live task execution.
+- **Prometheus metrics** at `/metrics` ([backend/metrics.py](backend/metrics.py)): RED metrics labelled by *route template* (bounded cardinality), plus scrape-time gauges for Celery queue depth, workers online, dead letters, outbox backlog, open SSE streams and Redis up/down per role. Bearer `METRICS_TOKEN`; **disabled in production without a token**. Multi-process aware (gunicorn).
+- **Grafana dashboard + alert rules** (`observability/`): `docker compose --profile observability up` → Grafana :3000 (provisioned "PPA – Service overview", 16 panels), Prometheus :9090 (alerts: error rate, p95, Redis down, queue backlog, no workers, dead letters, outbox backlog), Jaeger :16686. Celery task metrics come from Flower's `/metrics`.
+- **Distributed tracing (OpenTelemetry)** ([backend/tracing.py](backend/tracing.py)): off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. One trace per request: Flask route → SQLAlchemy queries → Redis commands → outgoing HTTP → Celery publish → worker task (context propagated through task headers). `trace_id` is added to every JSON log line.
+  ```bash
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile observability up --build
+  ```
+- **Measured numbers**: [docs/PERFORMANCE.md](docs/PERFORMANCE.md) (reproducible with `scripts/benchmark.py` and Locust).
+
+---
+
+## Database & migrations
+
+Schema changes are version-controlled with **Alembic** (Flask-Migrate) in [migrations/](migrations/):
+`0001` baseline · `0002` query indexes · `0003` composite indexes for the sorted lists · `0004` refresh tokens + outbox events.
+
+```bash
+flask --app backend/app.py db upgrade                      # apply (the Docker entrypoint does this)
+flask --app backend/app.py db migrate -m "add column x"    # after editing models.py
+flask --app backend/app.py db check                        # CI: models and migrations agree
+```
+- Development: `AUTO_MIGRATE=1` applies pending migrations on boot. A database created by the old `db.create_all()` is automatically **stamped** at the baseline first, so upgrading an existing `ppa.db` just adds the new indexes.
+- Production: `AUTO_MIGRATE=0`; run `db upgrade` explicitly.
+- `python scripts/explain_queries.py` prints query plans (`EXPLAIN ANALYZE` on PostgreSQL). Every heavy query uses an index; the composite indexes remove the sort step for "approved drives by deadline" and "applications for a drive by date".
+
+14 tables: `users, student_profiles, company_profiles, placement_drives, applications, drive_approvals, interviews, placement_history, monthly_reports, notifications, async_jobs, skills, refresh_tokens, outbox_events`.
+
+---
+
+## API
+
+57 paths in [api.yaml](api.yaml), validated as OpenAPI 3 in CI **and checked against the routes Flask actually serves** (`tests/test_api_spec.py` fails if they drift), rendered at `/api/docs`.
+
+- **Versioned**: `/api/v1/...`. Old unversioned `/api/...` paths still work as a deprecated alias (responses carry `Deprecation: true` and a `Link: rel="successor-version"` header). `/health` and the docs are unversioned.
+- **Pagination everywhere**: `?page=&per_page=` (default 6, max 50) → `{items,total,pages,page,per_page,has_next,has_prev}`. `page=999` returns an empty list, not an error.
+- **Errors**: `{ "error": "..." }`; rate limits return `429` + `Retry-After`; unexpected errors return `500` with a `request_id`.
+- **Async endpoints** (`reports/generate`, `export-applications`) return `202 {job_id, mode}`; poll `GET /jobs/<id>`.
+- **Idempotency**: send `Idempotency-Key: <uuid>` on POSTs that create things; retries replay the original response.
+- **Live updates**: `GET /notifications/stream` (SSE, resumable with `Last-Event-ID`).
+- **Auth flow**: `/auth/login` → access token + cookies, `/auth/refresh`, `/auth/logout`, `/auth/logout-all`.
+
+---
+
+## Testing, load testing, chaos
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q          # 223 tests: auth/JWT/blacklist, refresh-token rotation + reuse detection + CSRF, Idempotency-Key,
+                   #   rate limits, cache (memory + fake Redis), storage (disk + S3/moto + Azure fake), outbox/SSE,
+                   #   metrics + tracing, tasks/retries/idempotency/DLQ, eligibility, uploads, OpenAPI contract, SQL audit
+flake8             # lint
+```
+- `locust -f loadtests/locustfile.py --host http://localhost:5001 -u 50 -r 10 -t 60s --headless --html loadtests/report.html` — 50 users (admins hammering *Generate Report*, students browsing). Expect `POST /reports/generate` to stay fast (enqueue only), reads to be cache hits, and the per-user limiter to answer `429`s. **Add your own screenshot of `report.html` here after a run.**
+- `python scripts/chaos_demo.py` — scripted story for a demo video: queue works → stop both Redis containers → `/health` degrades → a report still completes inline → Redis returns → async resumes.
+- `python scripts/redis_ttl_audit.py` — flags application keys without an expiry.
+- `python scripts/benchmark.py --write` — reproducible before/after numbers (statement counts + latency); results in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+---
+
+## Deploying
+
+- Docker: `docker compose up --build` locally; production overlay with HTTPS: `docker-compose.prod.yml` + `deploy/Caddyfile`.
+- **Free hosting options, Azure free-tier facts and a pre-flight checklist: [docs/DEPLOY_FREE.md](docs/DEPLOY_FREE.md).**
+- File storage for multi-replica setups: [docs/STORAGE.md](docs/STORAGE.md).
+
+---
+
+## Configuration
+
+All configuration is environment variables; see [.env.example](.env.example) for the full annotated list. The ones that matter most:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `APP_ENV` | `development` | `production` requires real secrets, JSON logs, no auto-migrate |
+| `DATABASE_URL` | SQLite file | PostgreSQL URL in production |
+| `REDIS_URL` / `CELERY_BROKER_URL` / `STATE_REDIS_URL` | DB 0 / 1 / 2 of one local Redis | cache / queue / durable state |
+| `TRUSTED_PROXY_COUNT` | `0` | reverse-proxy hops to trust for client IP |
+| `CORS_ORIGINS` | *(empty = off)* | cross-origin allow-list |
+| `LOGIN_RATE_LIMIT`, `LOGIN_EMAIL_RATE_LIMIT`, `HEAVY_ENDPOINT_RATE_LIMIT` | 20 / 10 / 10 per min | rate limits |
+| `SENTRY_DSN`, `LOG_LEVEL`, `LOG_JSON` | — | observability |
+| `METRICS_TOKEN`, `OTEL_EXPORTER_OTLP_ENDPOINT` | — | `/metrics` auth (disabled in prod without it); enable tracing |
+| `STORAGE_BACKEND`, `S3_*`, `AZURE_STORAGE_*` | `local` | where files live |
+| `JWT_ACCESS_TOKEN_EXPIRES`, `REFRESH_TOKEN_DAYS`, `COOKIE_SECURE` | 900 s / 7 d / off (on in prod) | sessions |
+| `SSE_MAX_CONNECTIONS`, `SSE_MAX_SECONDS` | 50 / 300 | live-notification capacity |
+| `MAIL_*`, `GCHAT_WEBHOOK_URL` | unset | optional notifications (skipped when unset) |
+
+The app has no dependency on any hosting platform: it is a Docker image + PostgreSQL + Redis, so it runs the same on a laptop, a VM, or any container host.
+
+---
+
+## Project structure
+
+```
+backend/
+  app.py              app factory, auth/notification/health/docs routes, request hooks, error handlers
+  config.py           env-driven config (three Redis roles, rate limits, logging, secrets)
+  cache.py            Redis pools + circuit breaker, versioned cache-aside, stampede lock, memory fallback
+  ratelimit.py        atomic fixed-window limiter (+ @rate_limit decorator)
+  auth.py             JWT, jti blacklist, role decorators
+  celery_worker.py    Celery config, DLQ hook, request-id propagation
+  tasks.py            reminders, monthly report, CSV export (retries + idempotency)
+  async_dispatch.py   "queue if a worker is alive, else run inline"
+  dead_letter.py      dead-letter list: push / list / replay
+  logging_config.py   JSON logs, request-id context
+  validators.py       validation, sanitising, PDF signature check
+  sessions.py         refresh tokens: rotation, reuse detection, cookies, CSRF
+  idempotency.py      Idempotency-Key decorator
+  events.py           outbox -> Redis Streams -> SSE
+  storage.py          local / S3-compatible / Azure Blob
+  metrics.py  tracing.py   Prometheus RED metrics + live gauges; OpenTelemetry
+  pagination.py  models.py  SampleDataSeed.py  routes/{admin,company,student}.py
+frontend/             Vue 3 SPA (templates/index.html, static/js/app.js), PWA manifest + service worker
+migrations/           Alembic revisions 0001-0004
+tests/                pytest suite
+scripts/              chaos_demo.py, benchmark.py, explain_queries.py, redis_ttl_audit.py, migrate_storage.py, make_dashboard.py
+observability/        prometheus.yml, alerts.yml, Grafana provisioning + dashboard
+docs/                 PERFORMANCE.md, STORAGE.md, DEPLOY_FREE.md
+loadtests/            locustfile.py
+docker/entrypoint.sh  web | worker | beat | flower | migrate | seed
+Dockerfile  docker-compose.yml  api.yaml  requirements*.txt  setup.cfg  .github/workflows/test.yml
 ```
 
 ---
 
-## Deploy to Railway — 3-Service True Async
-1. Push `main` → Railway `Deploy from GitHub` → Add `Postgres`+`Redis` plugins (auto `DATABASE_URL`/`REDIS_URL`)
-2. Paste `.env` into `Variables` (Raw Editor) on `web/worker/beat` → set strong `SECRET_KEY/JWT/ADMIN_PASSWORD` (required in prod)
-3. `Volumes → /data` + `UPLOAD_FOLDER=/data/uploads` `REPORTS_FOLDER=/data/reports` `EXPORTS_FOLDER=/data/exports` on all 3
-4. Create 3 services override `Start Command` per above
-5. Custom Domain `Settings → Networking → Generate/Custom` → add `CNAME` → TLS → `/health` verify
+## Demo accounts
+
+Seeded automatically on first boot (`AUTO_SEED=1`) or with `python seed.py`. **Change or disable these anywhere that is not a demo** (`AUTO_SEED=0`, strong `ADMIN_PASSWORD`).
+
+| Role | Email | Password |
+|---|---|---|
+| Admin | `jainparth7040@gmail.com` | `admin123` |
+| Company | `hr@technova.com` / `careers@greenleaf.com` | `Tech@123` / `Green@123` |
+| Students | `rahul.verma@student.com`, `kavya.nair@student.com`, `rohan.joshi@student.com`, `sneha.patel@student.com`, `arjun.mehta@student.com` | `Rahul@123`, `Kavya@123`, `Rohan@123`, `Sneha@123`, `Arjun@123` |
+
+Sample résumés for the ATS check are in `Sample Resumes/`; the expected score matrix is in [sample_test_data.md](sample_test_data.md).
 
 ---
 
-## Verification
-`GET /health` `{status:ok,db:true,redis:true}` 200, `POST /login` 200 (6th in 60s → `429`), `POST /logout` → token blacklisted → `GET /auth/me` with old token → `401`, `GET /companies?page=1&per_page=6`→`{items,pages}`, `GET /api/docs` ReDoc + `GET /api/openapi.yaml`, ATS cached fallback, CSV poll sync fallback when Redis down.
+## Limitations & roadmap
 
-**Break-check (automated):** `python -m py_compile backend/*.py` OK, login→blacklist→re-login flow verified (`in-memory` fallback when Redis down), pagination `{items,total,pages}` on 12 endpoints, `seed.py` wrapper, `workers 1` free tier, `.env` gitignored, `api.yaml` served at `/api/openapi.yaml`.
-
----
-
-## Limitations & Roadmap
-`logout → JTI blacklist` now stateful (TTL until `exp`), but distributed in-memory fallback not shared across multiple `gunicorn` workers — use Redis (`bl:<jti>`) for true multi-worker revocation. Search still client limit 20, move storage to S3, `WebSockets` for notifications.
+- Search is a `LIKE` scan limited to 20 rows (fine at campus scale; PostgreSQL full-text search or `pg_trgm` next).
+- SSE holds a thread per open stream; for thousands of concurrent users use an async worker class or a dedicated stream service.
+- Passwords use Werkzeug's scrypt: deliberately slow (≈0.6 s p50 under 25 concurrent logins on one CPU) — consider a separate auth worker pool at scale.
+- "My interviews" lists are paginated in Python after loading; a SQL join would scale better.
+- Notifications are polled; WebSockets/SSE would make them live.
+- Blacklist check fails open if the state Redis is unreachable (see Security).
+- `datetime.utcnow()` is still used in places (deprecated, works); migrating to timezone-aware datetimes needs a data migration.

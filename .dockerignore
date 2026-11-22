@@ -8,9 +8,14 @@ venv
 .ok
 .vscode
 .idea
+.github
+tests
+loadtests
 instance/*.db
+backend/instance/*.db
 uploads/
 exports/
 reports/
 celerybeat-schedule*
-Sample\ Resumes
+Sample Resumes
+.env

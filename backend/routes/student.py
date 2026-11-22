@@ -1,15 +1,23 @@
-from flask import Blueprint, request, jsonify, send_file, current_app
+import hashlib
+import logging
+from flask import Blueprint, request, jsonify
+from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash
 from werkzeug.utils import secure_filename
-from models import db, User, StudentProfile, PlacementDrive, Application, Notification, AsyncJob, Skill, PlacementHistory
-from auth import login_required, role_required
-from cache import cache_get, cache_set, cache_delete
+from models import db, User, StudentProfile, PlacementDrive, Application, AsyncJob, Skill, PlacementHistory
+from events import notify
+from auth import role_required
+from cache import cache_get, cache_set, cache_get_or_set, make_key, invalidate
+from ratelimit import rate_limit
+from idempotency import idempotent
+from storage import get_storage
+from routes.company import company_cache_ns
 from pagination import paginated_response
 from datetime import datetime
-import os
-from validators import validate_email, validate_password, validate_phone, validate_cgpa, validate_year, validate_name
+from validators import validate_email, validate_password, validate_phone, validate_cgpa, validate_year, validate_name, clean_text, clean_list, is_pdf
 
 student_bp = Blueprint('student', __name__)
+log = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {'pdf'}
 
@@ -27,7 +35,7 @@ def register_student():
 
     email = data.get('email', '').strip()
     password = data.get('password', '').strip()
-    full_name = data.get('full_name', '').strip()
+    full_name = clean_text(data.get('full_name', ''), 100)
 
     if not all([email, password, full_name]):
         return jsonify({'error': 'Email, password, and full name are required'}), 400
@@ -67,22 +75,20 @@ def register_student():
     student = StudentProfile(
         user_id=user.id,
         full_name=full_name,
-        department=data.get('department', ''),
+        department=clean_text(data.get('department', ''), 50),
         cgpa=float(data.get('cgpa', 0)),
         graduation_year=int(data.get('graduation_year', 0)) if data.get('graduation_year') else None,
         phone=data.get('phone', ''),
-        bio=data.get('bio', ''),
+        bio=clean_text(data.get('bio', '')),
     )
     db.session.add(student)
+    db.session.flush()   # student.id is needed for the skills below
 
-    # Add skills
-    skills = data.get('skills', [])
-    for s in skills:
-        skill = Skill(student_id=student.id, skill_name=s.strip())
-        db.session.add(skill)
+    for skill_name in clean_list(data.get('skills', [])):
+        db.session.add(Skill(student_id=student.id, skill_name=skill_name))
 
     db.session.commit()
-    cache_delete('admin_stats')
+    invalidate('stats')
     return jsonify({'message': 'Student registered successfully', 'student': student.to_dict()}), 201
 
 
@@ -103,14 +109,14 @@ def update_student_profile(user):
     if not student:
         return jsonify({'error': 'Student profile not found'}), 404
 
-    data = request.json
+    data = request.get_json(silent=True) or {}
     if data.get('full_name'):
         ok, err = validate_name(data['full_name'], 'Full name')
         if not ok:
             return jsonify({'error': err}), 400
-        student.full_name = data['full_name']
+        student.full_name = clean_text(data['full_name'], 100)
     if data.get('department'):
-        student.department = data['department']
+        student.department = clean_text(data['department'], 50)
     if 'cgpa' in data:
         ok, err = validate_cgpa(data['cgpa'])
         if not ok:
@@ -127,14 +133,13 @@ def update_student_profile(user):
             return jsonify({'error': err}), 400
         student.phone = data['phone']
     if data.get('bio'):
-        student.bio = data['bio']
+        student.bio = clean_text(data['bio'])
 
     # Update skills
     if 'skills' in data:
         Skill.query.filter_by(student_id=student.id).delete()
-        for s in data['skills']:
-            skill = Skill(student_id=student.id, skill_name=s.strip())
-            db.session.add(skill)
+        for skill_name in clean_list(data['skills']):
+            db.session.add(Skill(student_id=student.id, skill_name=skill_name))
 
     db.session.commit()
     return jsonify({'message': 'Profile updated', 'student': student.to_dict()}), 200
@@ -157,60 +162,48 @@ def upload_resume(user):
 
     if not allowed_file(file.filename):
         return jsonify({'error': 'Only PDF files allowed'}), 400
+    if not is_pdf(file):
+        # extension says .pdf but the content is not a PDF (e.g. a renamed .exe/.docx)
+        log.warning('upload_rejected_not_pdf', extra={'event': 'upload_rejected_not_pdf', 'student_id': student.id})
+        return jsonify({'error': 'File content is not a valid PDF'}), 400
 
-    upload_dir = os.path.join(current_app.config.get('UPLOAD_FOLDER', 'uploads'), 'resumes')
-    os.makedirs(upload_dir, exist_ok=True)
     filename = secure_filename(f"resume_{student.id}_{file.filename}")
-    filepath = os.path.join(upload_dir, filename)
-    file.save(filepath)
-
-    # Store relative path for portability across deployments (ephemeral FS -> absolute paths break)
-    try:
-        rel_path = os.path.relpath(filepath, start=os.getcwd())
-    except ValueError:
-        rel_path = filepath
-    # Fallback: store as uploads/resumes/<filename> so it works regardless of cwd
-    if os.path.isabs(rel_path) and '..' in rel_path:
-        rel_path = os.path.join('uploads', 'resumes', filename)
-    student.resume_path = rel_path
+    if not filename.lower().endswith('.pdf'):
+        filename += '.pdf'
+    key = f"resumes/{filename}"
+    get_storage().put_bytes(key, file.stream.read(), 'application/pdf')   # <= 5 MB (MAX_CONTENT_LENGTH)
+    student.resume_path = key
     db.session.commit()
-    return jsonify({'message': 'Resume uploaded successfully', 'resume_path': rel_path}), 200
+    return jsonify({'message': 'Resume uploaded successfully', 'resume_path': key}), 200
 
 
-# browse drives (cached) — paginated: ?search&branch&page&per_page
+# browse drives — cached per (filters, page); 'drives' namespace is bumped on any drive change
 @student_bp.route('/api/student/drives', methods=['GET'])
 @role_required('student')
 def browse_drives(user):
-    search = request.args.get('search', '').strip()
-    branch = request.args.get('branch', '').strip()
+    search = clean_text(request.args.get('search', ''), 100)
+    branch = clean_text(request.args.get('branch', ''), 50)
     min_cgpa = request.args.get('min_cgpa', None, type=float)
-    page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 6, type=int)
+    page = max(1, request.args.get('page', 1, type=int))
+    per_page = min(50, max(1, request.args.get('per_page', 6, type=int)))
 
-    # cache only first page without filters (common case)
-    if not search and not branch and min_cgpa is None and page == 1 and per_page == 6:
-        cached = cache_get('approved_drives_paginated')
-        if cached:
-            return jsonify(cached), 200
+    def build():
+        query = PlacementDrive.query.filter_by(status='approved')
+        if search:
+            query = query.filter(
+                (PlacementDrive.drive_name.ilike(f'%{search}%')) |
+                (PlacementDrive.job_title.ilike(f'%{search}%')) |
+                (PlacementDrive.location.ilike(f'%{search}%'))
+            )
+        if branch:
+            query = query.filter(PlacementDrive.eligibility_branch.ilike(f'%{branch}%'))
+        if min_cgpa is not None:
+            query = query.filter(PlacementDrive.min_cgpa <= min_cgpa)
+        query = query.order_by(PlacementDrive.application_deadline.asc(), PlacementDrive.id.asc())
+        return paginated_response(query, page, per_page)
 
-    query = PlacementDrive.query.filter_by(status='approved')
-
-    if search:
-        query = query.filter(
-            (PlacementDrive.drive_name.ilike(f'%{search}%')) |
-            (PlacementDrive.job_title.ilike(f'%{search}%')) |
-            (PlacementDrive.location.ilike(f'%{search}%'))
-        )
-    if branch:
-        query = query.filter(PlacementDrive.eligibility_branch.ilike(f'%{branch}%'))
-
-    query = query.order_by(PlacementDrive.application_deadline.asc())
-    data = paginated_response(query, page, per_page)
-
-    if not search and not branch and min_cgpa is None and page == 1 and per_page == 6:
-        cache_set('approved_drives_paginated', data, ttl=600)
-
-    return jsonify(data), 200
+    key = make_key('drives', 'browse', search.lower(), branch.lower(), min_cgpa, page, per_page)
+    return jsonify(cache_get_or_set(key, build, ttl=300)), 200
 
 
 @student_bp.route('/api/student/drives/<int:id>', methods=['GET'])
@@ -231,6 +224,7 @@ def drive_detail(user, id):
 # apply for drive
 @student_bp.route('/api/student/apply/<int:drive_id>', methods=['POST'])
 @role_required('student')
+@idempotent
 def apply_for_drive(user, drive_id):
     student = StudentProfile.query.filter_by(user_id=user.id).first()
     if not student:
@@ -262,23 +256,24 @@ def apply_for_drive(user, drive_id):
     if existing:
         return jsonify({'error': 'You have already applied for this drive'}), 409
 
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     application = Application(
         student_id=student.id,
         drive_id=drive_id,
         status='applied',
-        cover_letter=data.get('cover_letter', ''),
+        cover_letter=clean_text(data.get('cover_letter', '')),
     )
     db.session.add(application)
 
     # notify
-    notification = Notification(
-        user_id=drive.company.user_id,
-        message=f'{student.full_name} applied for "{drive.drive_name}".',
-        channel='in-app', is_sent=True,
-    )
-    db.session.add(notification)
-    db.session.commit()
+    notify(drive.company.user_id, f'{student.full_name} applied for "{drive.drive_name}".')
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # two simultaneous requests passed the 'already applied' check; the unique constraint caught it
+        db.session.rollback()
+        return jsonify({'error': 'You have already applied for this drive'}), 409
+    invalidate('stats', company_cache_ns(drive.company_id))
 
     return jsonify({'message': 'Application submitted successfully', 'application': application.to_dict()}), 201
 
@@ -310,6 +305,7 @@ def withdraw_application(user, id):
 
     app.status = 'withdrawn'
     db.session.commit()
+    invalidate('stats', company_cache_ns(app.drive.company_id) if app.drive else 'stats')
     return jsonify({'message': 'Application withdrawn', 'application': app.to_dict()}), 200
 
 
@@ -335,7 +331,6 @@ def my_interviews(user):
         return jsonify({'error': 'Student profile not found'}), 404
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 6, type=int)
-    from models import Interview
     apps = Application.query.filter_by(student_id=student.id).all()
     interviews = []
     for app in apps:
@@ -363,35 +358,24 @@ def my_interviews(user):
     }), 200
 
 
-# export csv (async with sync fallback for single-web deploy)
+# export csv — queued on Celery when a worker is alive, otherwise runs inline
 @student_bp.route('/api/student/export-applications', methods=['POST'])
 @role_required('student')
+@idempotent
+@rate_limit('export')
 def export_applications(user):
     student = StudentProfile.query.filter_by(user_id=user.id).first()
     if not student:
         return jsonify({'error': 'Student profile not found'}), 404
 
-    job = AsyncJob(
-        user_id=user.id,
-        job_type='export_applications_csv',
-        status='pending',
-    )
+    job = AsyncJob(user_id=user.id, job_type='export_applications_csv', status='pending')
     db.session.add(job)
     db.session.commit()
 
     from tasks import export_applications_csv
-    from cache import get_redis
-    try:
-        if get_redis() is None:
-            raise RuntimeError("Redis unavailable — running sync")
-        export_applications_csv.delay(user.id, student.id, job.id)
-    except Exception as e:
-        print(f"[!] Celery delay failed ({e}), falling back to sync CSV export")
-        try:
-            export_applications_csv(user.id, student.id, job.id)
-        except Exception as se:
-            print(f"[!] Sync CSV also failed: {se}")
-    return jsonify({'message': 'Export job started', 'job_id': job.id}), 202
+    from async_dispatch import dispatch
+    mode = dispatch(export_applications_csv, user.id, student.id, job.id)
+    return jsonify({'message': 'Export job started', 'job_id': job.id, 'mode': mode}), 202
 
 
 # download export
@@ -403,14 +387,16 @@ def download_export(user, job_id):
         return jsonify({'error': 'Unauthorized'}), 403
     if job.status != 'completed':
         return jsonify({'error': 'Export not ready yet', 'status': job.status}), 400
-    if job.file_path and os.path.exists(job.file_path):
-        return send_file(job.file_path, as_attachment=True, download_name='my_applications.csv')
-    return jsonify({'error': 'Export file not found'}), 404
+    try:
+        return get_storage().send(job.file_path, 'my_applications.csv', 'text/csv')
+    except (FileNotFoundError, ValueError, TypeError):
+        return jsonify({'error': 'Export file not found'}), 404
 
 
 # ats resume check
 @student_bp.route('/api/student/ats-check', methods=['POST'])
 @role_required('student')
+@rate_limit('ats')
 def ats_check(user):
     try:
         student = StudentProfile.query.filter_by(user_id=user.id).first()
@@ -432,30 +418,18 @@ def ats_check(user):
         job_desc += f"Required Branch: {drive.eligibility_branch or 'All'}\n"
         job_desc += f"Min CGPA: {drive.min_cgpa or 'None'}"
 
-        # get text from resume pdf — handle both absolute and relative paths for hosting portability
+        # text from the stored resume PDF (any storage backend; legacy local paths still resolve)
         resume_text = ""
-        resume_path_to_check = None
         if student.resume_path:
-            # Try stored path as-is, then relative to UPLOAD_FOLDER, then relative to BASE_DIR
-            candidates = [student.resume_path]
-            # If stored as relative like "uploads/resumes/file.pdf", resolve against cwd and BASE_DIR
-            if not os.path.isabs(student.resume_path):
-                candidates.append(os.path.join(current_app.config.get('UPLOAD_FOLDER', 'uploads'), os.path.basename(student.resume_path)))
-                candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', student.resume_path))
-                candidates.append(os.path.abspath(student.resume_path))
-            for cand in candidates:
-                if cand and os.path.exists(cand):
-                    resume_path_to_check = cand
-                    break
-        if resume_path_to_check:
             try:
+                import io
                 import PyPDF2
-                with open(resume_path_to_check, 'rb') as f:
-                    reader = PyPDF2.PdfReader(f)
-                    for page in reader.pages:
-                        resume_text += page.extract_text() or ''
-            except Exception:
-                resume_text = ""
+                reader = PyPDF2.PdfReader(io.BytesIO(get_storage().get_bytes(student.resume_path)))
+                resume_text = ''.join((page.extract_text() or '') for page in reader.pages)
+            except FileNotFoundError:
+                log.warning('resume_file_missing', extra={'event': 'resume_file_missing', 'student_id': student.id})
+            except Exception as e:  # noqa: BLE001 - unreadable PDF => fall back to profile text
+                log.warning('resume_unreadable', extra={'event': 'resume_unreadable', 'student_id': student.id, 'error': str(e)[:120]})
 
         if not resume_text.strip():
             # fallback if no pdf
@@ -466,7 +440,9 @@ def ats_check(user):
             resume_text += f"Bio: {student.bio or ''}"
 
         # check cache first — avoids 20s HF sleep on repeat
-        cache_key = f"ats:{student.id}:{drive_id}:{hash(resume_text[:100])}"
+        # NB: builtin hash() is randomised per process, so it never matched across workers/restarts - use sha256.
+        digest = hashlib.sha256((resume_text + '\x00' + job_desc).encode('utf-8')).hexdigest()[:24]
+        cache_key = make_key('ats', student.id, drive_id, digest)
         cached = cache_get(cache_key)
         if cached:
             return jsonify({'result': cached, 'resume_preview': resume_text[:200] + '...', 'cached': True}), 200
@@ -477,17 +453,20 @@ def ats_check(user):
             client = Client("parthjain/ResumeAnalyser")
             result = client.predict(resume_text, job_desc, api_name="/analyze_resume")
         except Exception as hf_e:
-            # HF Space sleeping — return fallback analysis instead of 500 so recruiter sees result
+            # HF Space sleeping/unreachable — degrade gracefully instead of 500 (and never cache the fallback)
+            log.warning('hf_api_fallback', extra={'event': 'hf_api_fallback', 'student_id': student.id, 'drive_id': drive_id, 'reason': str(hf_e)[:120]})
             return jsonify({
                 'result': f"ATS service temporarily unavailable (HF Space sleeping). Fallback — Resume preview matches JD branch {drive.eligibility_branch} min CGPA {drive.min_cgpa}. Raw error: {str(hf_e)[:100]}",
                 'resume_preview': resume_text[:200] + '...',
-                'fallback': True
+                'fallback': True,
+                'retry_after_minutes': 10,
             }), 200
         # cache 10 min
-        cache_set(cache_key, result, ttl=600)
+        cache_set(cache_key, result, ttl=600)   # cache 10 min
         return jsonify({'result': result, 'resume_preview': resume_text[:200] + '...'}), 200
 
-    except Exception as e:
-        return jsonify({'error': f'ATS check failed: {str(e)}. Please try again later.'}), 500
+    except Exception:
+        log.exception('ats_check_failed', extra={'event': 'ats_check_failed'})
+        return jsonify({'error': 'ATS check failed. Please try again later.'}), 500
 
 

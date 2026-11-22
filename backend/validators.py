@@ -65,3 +65,44 @@ def validate_name(name, field='Name'):
     if len(name.strip()) > 150:
         return False, f'{field} is too long'
     return True, None
+
+
+# --------------------------------------------------------------------------- sanitisation
+_TAG_RE = re.compile(r'<[^>]*>')
+_CTRL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def clean_text(value, max_len=None):
+    """Strip HTML tags and control characters from user-supplied free text (stored-XSS defence).
+
+    The Vue frontend already escapes output, but the same strings also end up in HTML e-mails and
+    PDF reports, so we sanitise on the way in rather than trusting every consumer.
+    Non-strings are returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    value = _CTRL_RE.sub('', value)
+    previous = None
+    while previous != value:       # handles nested tricks like "<<b>script>"
+        previous = value
+        value = _TAG_RE.sub('', value)
+    value = value.replace('<', '').replace('>', '').strip()
+    return value[:max_len] if max_len else value
+
+
+def clean_list(values, max_len=100, max_items=50):
+    if not isinstance(values, list):
+        return []
+    out = []
+    for v in values[:max_items]:
+        v = clean_text(v, max_len) if isinstance(v, str) else ''
+        if v:
+            out.append(v)
+    return out
+
+
+def is_pdf(file_storage):
+    """Check the real file signature (magic bytes), not just the extension. Rewinds the stream."""
+    head = file_storage.stream.read(5)
+    file_storage.stream.seek(0)
+    return head == b'%PDF-'

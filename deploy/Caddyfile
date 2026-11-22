@@ -1,0 +1,23 @@
+{$DOMAIN} {
+	encode gzip
+
+	# Do not expose operational endpoints to the internet (Prometheus scrapes web:5001 directly on the internal network).
+	@internal path /metrics
+	respond @internal 404
+
+	reverse_proxy web:5001 {
+		# Server-Sent Events (live notifications): never buffer the response
+		flush_interval -1
+		# streams last up to SSE_MAX_SECONDS; don't time them out early
+		transport http {
+			response_header_timeout 0
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
